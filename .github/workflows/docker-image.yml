@@ -18,6 +18,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Run Trivy vulnerability scanner
+        env:
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/my-app:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1' # Laat de build falen als er kritieke lekken worden gevonden
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
