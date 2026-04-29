@@ -1,0 +1,15 @@
+services:
+  ghostbudget:
+    image: niqck/ghostbudget:latest
+    container_name: ghostbudget
+    restart: unless-stopped
+    volumes:
+      - data:/actual-budget
+      - ./config/config.json:/app/config.json:ro
+    env_file:
+      - .env
+    environment:
+      - CRON_TASK=${CRON_TASK:-0 5 * * *}
+
+volumes:
+  data:
