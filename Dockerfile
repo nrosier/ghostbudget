@@ -3,6 +3,7 @@ RUN apk add --no-cache bash
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
+RUN npm update
 COPY . .
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
