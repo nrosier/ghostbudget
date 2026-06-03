@@ -1,6 +1,11 @@
 name: Dependabot Auto-merge
 
-on: pull_request_target
+on:
+  pull_request_target:
+  schedule:
+    # Run daily at 09:00 UTC to process any pending Dependabot PRs
+    - cron: '0 9 * * *'
+  workflow_dispatch: # Allow manual triggering
 
 permissions:
   pull-requests: write
@@ -9,7 +14,7 @@ permissions:
 jobs:
   dependabot:
     runs-on: ubuntu-latest
-    if: ${{ github.actor == 'dependabot[bot]' }}
+    if: ${{ github.event_name == 'pull_request_target' && github.actor == 'dependabot[bot]' }}
 
     steps:
       - name: Dependabot metadata
@@ -30,4 +35,50 @@ jobs:
         run: gh pr merge --auto --merge "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  process-pending-prs:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Process pending Dependabot PRs
+        run: |
+          echo "Checking for pending Dependabot PRs..."
+          
+          # Get all open PRs from Dependabot
+          gh pr list --author "app/dependabot" --state open --json number,title,url,labels --limit 100 > prs.json
+          
+          # Process each PR
+          jq -c '.[]' prs.json | while read -r pr; do
+            PR_NUMBER=$(echo "$pr" | jq -r '.number')
+            PR_URL=$(echo "$pr" | jq -r '.url')
+            PR_TITLE=$(echo "$pr" | jq -r '.title')
+            HAS_AUTOMERGE=$(echo "$pr" | jq -r '.labels[] | select(.name == "automerge") | .name')
+            
+            echo "Processing PR #$PR_NUMBER: $PR_TITLE"
+            
+            # Skip if it's a major update (contains "major" in title)
+            if echo "$PR_TITLE" | grep -qi "major"; then
+              echo "  Skipping major update - requires manual review"
+              continue
+            fi
+            
+            # Check if PR has automerge label
+            if [ -n "$HAS_AUTOMERGE" ]; then
+              echo "  Auto-approving PR #$PR_NUMBER"
+              gh pr review "$PR_NUMBER" --approve || echo "  Already approved or failed to approve"
+              
+              echo "  Enabling auto-merge for PR #$PR_NUMBER"
+              gh pr merge "$PR_NUMBER" --auto --merge || echo "  Auto-merge already enabled or failed"
+            else
+              echo "  Skipping - no automerge label"
+            fi
+          done
+          
+          echo "Finished processing Dependabot PRs"
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
