@@ -2,8 +2,10 @@
 # Pin to exact digest for immutability and security
 FROM node:lts-alpine
 
-# Install security updates and create non-root user
+# Install security updates, build tools for native modules, and create non-root user
+# Build tools are needed for better-sqlite3 (used by @actual-app/api)
 RUN apk upgrade --no-cache && \
+    apk add --no-cache python3 make g++ && \
     addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001 -G nodejs
 
@@ -16,10 +18,11 @@ COPY --chown=nodejs:nodejs package*.json ./
 # Install dependencies with security best practices
 # - Use npm ci for reproducible builds
 # - Omit dev dependencies
-# - Ignore scripts to prevent malicious code execution
+# - Allow scripts for native module compilation (better-sqlite3)
 # - Clean cache to reduce image size
-RUN npm ci --omit=dev --ignore-scripts && \
-    npm cache clean --force
+RUN npm ci --omit=dev && \
+    npm cache clean --force && \
+    apk del python3 make g++
 
 # Copy application files with correct ownership
 COPY --chown=nodejs:nodejs . .
