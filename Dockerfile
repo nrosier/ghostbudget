@@ -31,8 +31,8 @@ RUN chmod +x /app/entrypoint.sh
 RUN mkdir -p /app/logs && \
     chown -R nodejs:nodejs /app/logs
 
-# Switch to non-root user
-USER nodejs
+# Note: We do NOT switch to nodejs user here
+# The entrypoint needs root to set up cron and will drop privileges itself
 
 # Add health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

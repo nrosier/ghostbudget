@@ -25,7 +25,8 @@ export ACTUAL_BUDGET_DATA_DIR="${ACTUAL_BUDGET_DATA_DIR}"
 export GHOSTFOLIO_URL="${GHOSTFOLIO_URL}"
 EOF
 
-# Secure the environment file
+# Set ownership and permissions for the environment file
+chown nodejs:nodejs /app/project_env.sh
 chmod 600 /app/project_env.sh
 
 # Note: Secrets (ACTUAL_BUDGET_PASS, GHOSTFOLIO_TOKEN) are NOT written to file
