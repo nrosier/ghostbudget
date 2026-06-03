@@ -8,8 +8,9 @@ if [ -z "$CRON_TASK" ]; then
 fi
 
 # Validate cron expression format (basic validation)
-if ! echo "$CRON_TASK" | grep -qE '^[0-9\*\-\,\/\s]+$'; then
-    echo "ERROR: Invalid CRON_TASK format. Must contain only numbers, *, -, /, and spaces"
+# Allow: numbers, *, -, /, comma, and spaces
+if ! echo "$CRON_TASK" | grep -qE '^[0-9*/,[:space:]-]+$'; then
+    echo "ERROR: Invalid CRON_TASK format. Must contain only numbers, *, -, /, commas, and spaces"
     exit 1
 fi
 
