@@ -22,13 +22,6 @@ if [ -n "$ACTUAL_BUDGET_DATA_DIR" ] && [ -d "$ACTUAL_BUDGET_DATA_DIR" ]; then
     chmod -R u+rw "$ACTUAL_BUDGET_DATA_DIR"
 fi
 
-# Ensure config.json is readable by nodejs user
-if [ -f "/app/config.json" ]; then
-    echo "Setting permissions for config.json"
-    chown nodejs:nodejs /app/config.json
-    chmod 400 /app/config.json
-fi
-
 # Create secure environment file with only necessary variables
 # DO NOT export all environment variables - only export what's needed
 cat > /app/project_env.sh << EOF
