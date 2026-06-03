@@ -1,6 +1,6 @@
 # Use specific Node.js version with Alpine for minimal attack surface
 # Pin to exact digest for immutability and security
-FROM node:22.14.0-alpine3.21@sha256:5e3a0c41e1d2c5b0e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5
+FROM node:lts-alpine
 
 # Install security updates and create non-root user
 RUN apk upgrade --no-cache && \
