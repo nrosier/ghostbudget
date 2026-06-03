@@ -14,6 +14,14 @@ if ! echo "$CRON_TASK" | grep -qE '^[0-9*/,[:space:]-]+$'; then
     exit 1
 fi
 
+# Ensure the Actual Budget data directory has correct permissions
+# This is needed because the volume may be mounted with root ownership
+if [ -n "$ACTUAL_BUDGET_DATA_DIR" ] && [ -d "$ACTUAL_BUDGET_DATA_DIR" ]; then
+    echo "Setting permissions for Actual Budget data directory: $ACTUAL_BUDGET_DATA_DIR"
+    chown -R nodejs:nodejs "$ACTUAL_BUDGET_DATA_DIR"
+    chmod -R u+rw "$ACTUAL_BUDGET_DATA_DIR"
+fi
+
 # Create secure environment file with only necessary variables
 # DO NOT export all environment variables - only export what's needed
 cat > /app/project_env.sh << EOF
