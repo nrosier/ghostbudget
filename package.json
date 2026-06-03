@@ -19,7 +19,7 @@
     "@actual-app/api": "26.6.0",
     "axios": "1.17.0",
     "dotenv": "17.4.2",
-    "joi": "17.13.3",
+    "joi": "18.2.1",
     "winston": "3.19.0"
   },
   "devDependencies": {
@@ -28,7 +28,7 @@
     "eslint": "10.2.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
-    "eslint-plugin-security": "3.0.1",
+    "eslint-plugin-security": "4.0.0",
     "jest": "30.3.0",
     "nock": "14.0.12",
     "prettier": "3.8.2"
