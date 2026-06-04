@@ -1,5 +1,8 @@
 const Joi = require('joi');
+const validator = require('validator');
 const logger = require('../logger');
+const AuditLogger = require('./audit');
+const constants = require('../config/constants');
 
 /**
  * Schema for validating config.json structure
@@ -21,14 +24,28 @@ const configSchema = Joi.object({
  * Schema for validating environment variables
  */
 const envSchema = Joi.object({
-  ACTUAL_BUDGET_URL: Joi.string().uri().required(),
-  ACTUAL_BUDGET_PASS: Joi.string().min(1).required(),
+  ACTUAL_BUDGET_URL: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .pattern(/^https?:\/\/(localhost|127\.0\.0\.1|[\w\-\.]+\.[a-z]{2,})/)
+    .required(),
+  ACTUAL_BUDGET_PASS: Joi.string().min(constants.MIN_PASSWORD_LENGTH).required(),
   ACTUAL_BUDGET_SYNC_ID: Joi.string().min(1).required(),
   ACTUAL_BUDGET_DATA_DIR: Joi.string().allow('').optional(),
-  GHOSTFOLIO_URL: Joi.string().uri().required(),
-  GHOSTFOLIO_TOKEN: Joi.string().min(1).required(),
+  GHOSTFOLIO_URL: Joi.string()
+    .uri({ scheme: ['http', 'https'] })
+    .pattern(/^https?:\/\/(localhost|127\.0\.0\.1|[\w\-\.]+\.[a-z]{2,})/)
+    .required(),
+  GHOSTFOLIO_TOKEN: Joi.string().min(constants.MIN_TOKEN_LENGTH).required(),
   LOG_LEVEL: Joi.string().valid('error', 'warn', 'info', 'debug').default('info'),
   NODE_ENV: Joi.string().valid('development', 'production', 'test').default('production'),
+  // New configuration options
+  REQUEST_SECRET: Joi.string().min(32).optional(),
+  GHOSTFOLIO_CERT_FINGERPRINT: Joi.string().hex().length(64).optional(),
+  CACHE_TTL_MINUTES: Joi.number().integer().min(1).max(60).default(5),
+  BATCH_SIZE: Joi.number().integer().min(1).max(50).default(10),
+  MAX_RETRIES: Joi.number().integer().min(0).max(10).default(3),
+  METRICS_PORT: Joi.number().integer().min(1024).max(65535).default(3000),
+  ENABLE_METRICS: Joi.boolean().default(false),
 }).unknown(true); // Allow other env vars
 
 /**
@@ -68,6 +85,7 @@ function validateEnvironment(env) {
   if (error) {
     const details = error.details.map((d) => d.message).join('; ');
     logger.error('Environment validation failed', { details });
+    AuditLogger.logValidationFailure('environment', { details });
     throw new Error(`Invalid environment variables: ${details}`);
   }
 
@@ -106,12 +124,28 @@ function validateBalance(balance) {
  */
 function validateAccountName(name) {
   if (typeof name !== 'string' || name.trim().length === 0) {
+    AuditLogger.logValidationFailure('account_name', { reason: 'empty_string' });
     throw new Error('Account name must be a non-empty string');
   }
-  if (name.length > 255) {
-    throw new Error('Account name must not exceed 255 characters');
+
+  // Sanitize HTML entities to prevent XSS
+  const sanitized = validator.escape(name.trim());
+
+  if (sanitized.length > constants.MAX_ACCOUNT_NAME_LENGTH) {
+    AuditLogger.logValidationFailure('account_name', {
+      reason: 'too_long',
+      length: sanitized.length,
+    });
+    throw new Error(`Account name must not exceed ${constants.MAX_ACCOUNT_NAME_LENGTH} characters`);
   }
-  return name.trim();
+
+  // Check for suspicious patterns
+  if (/<script|javascript:|on\w+=/i.test(name)) {
+    AuditLogger.logSecurityEvent('xss_attempt', 'high', { input: 'account_name' });
+    throw new Error('Account name contains invalid characters');
+  }
+
+  return sanitized;
 }
 
 /**

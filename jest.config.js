@@ -7,4 +7,6 @@ module.exports = {
   verbose: true,
   // Add this to see what's happening with the mocks
   setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
+  // Transform ESM modules from node_modules
+  transformIgnorePatterns: ['node_modules/(?!(uuid)/)'],
 };

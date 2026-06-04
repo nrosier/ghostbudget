@@ -10,9 +10,14 @@ describe('ghostfolio', () => {
     jest.resetModules();
     nock.cleanAll();
 
-    // Set up environment
+    // Set up environment - add all required variables
     process.env.GHOSTFOLIO_URL = baseUrl;
     process.env.GHOSTFOLIO_TOKEN = 'test-token';
+    process.env.ACTUAL_BUDGET_URL = 'http://localhost:5006';
+    process.env.ACTUAL_BUDGET_PASS = 'test-pass';
+    process.env.ACTUAL_BUDGET_SYNC_ID = 'test-sync-id';
+    process.env.ACTUAL_BUDGET_DATA_DIR = '/test/dir';
+    process.env.NODE_ENV = 'test';
 
     // Import the module
     ghostfolio = require('../src/ghostfolio');

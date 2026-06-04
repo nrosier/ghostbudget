@@ -1,9 +1,14 @@
-require('dotenv').config();
 const axios = require('axios');
+const axiosRetry = require('axios-retry');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const CircuitBreaker = require('opossum');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
 const logger = require('./logger');
+const AuditLogger = require('./utils/audit');
+const { trackApiRequest } = require('./utils/metrics');
+const constants = require('./config/constants');
 const {
   validateConfig,
   validateEnvironment,
@@ -21,16 +26,91 @@ class GhostfolioAPI {
     this.accessToken = null;
     this.configPath = path.join(__dirname, '..', 'config.json');
 
-    // Create secure axios instance
-    this.axiosInstance = axios.create({
-      timeout: 30000, // 30 second timeout
-      maxContentLength: 10 * 1024 * 1024, // 10MB max
-      maxBodyLength: 10 * 1024 * 1024,
-      httpsAgent: new https.Agent({
-        rejectUnauthorized: true, // Enforce certificate validation
-        minVersion: 'TLSv1.2', // Minimum TLS version
-      }),
+    // Cache configuration
+    this.accountsCache = null;
+    this.accountsCacheExpiry = null;
+    this.cacheTTL = (env.CACHE_TTL_MINUTES || 5) * 60 * 1000;
+
+    // Rate limiter
+    this.rateLimiter = new RateLimiterMemory({
+      points: constants.RATE_LIMIT_POINTS,
+      duration: constants.RATE_LIMIT_DURATION,
     });
+
+    // Create secure axios instance with enhanced TLS
+    this.axiosInstance = axios.create({
+      timeout: constants.HTTP_TIMEOUT_MS,
+      maxContentLength: constants.MAX_CONTENT_LENGTH_BYTES,
+      maxBodyLength: constants.MAX_BODY_LENGTH_BYTES,
+      httpsAgent: new https.Agent({
+        rejectUnauthorized: true,
+        minVersion: constants.TLS_MIN_VERSION,
+        maxVersion: constants.TLS_MAX_VERSION,
+        ciphers: constants.TLS_CIPHERS,
+        honorCipherOrder: true,
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+      }),
+      validateStatus: (status) => status >= 200 && status < 300,
+    });
+
+    // Add retry logic with exponential backoff
+    axiosRetry(this.axiosInstance, {
+      retries: env.MAX_RETRIES || constants.MAX_RETRIES,
+      retryDelay: axiosRetry.exponentialDelay,
+      retryCondition: (error) => {
+        return (
+          axiosRetry.isNetworkOrIdempotentRequestError(error) || error.response?.status === 429
+        );
+      },
+      onRetry: (retryCount, error) => {
+        logger.warn('Retrying API request', {
+          retryCount,
+          error: sanitizeError(error),
+        });
+      },
+    });
+
+    // Create circuit breaker for API calls
+    this.breaker = new CircuitBreaker(this._makeRequest.bind(this), {
+      timeout: constants.CIRCUIT_BREAKER_TIMEOUT,
+      errorThresholdPercentage: constants.CIRCUIT_BREAKER_ERROR_THRESHOLD,
+      resetTimeout: constants.CIRCUIT_BREAKER_RESET_TIMEOUT,
+    });
+
+    this.breaker.on('open', () => {
+      logger.error('Circuit breaker opened - too many failures');
+      AuditLogger.logSecurityEvent('circuit_breaker_open', 'high', {
+        service: 'ghostfolio',
+      });
+    });
+
+    this.breaker.on('halfOpen', () => {
+      logger.info('Circuit breaker half-open - testing recovery');
+    });
+
+    this.breaker.on('close', () => {
+      logger.info('Circuit breaker closed - service recovered');
+    });
+  }
+
+  /**
+   * Make rate-limited API request
+   * @private
+   */
+  async _makeRequest(config) {
+    await this.rateLimiter.consume('ghostfolio-api');
+    return this.axiosInstance(config);
+  }
+
+  /**
+   * Make API request with circuit breaker and rate limiting
+   * @private
+   */
+  async _apiRequest(config) {
+    return this.breaker.fire(config);
   }
 
   async authenticate() {
@@ -38,8 +118,15 @@ class GhostfolioAPI {
       const env = validateEnvironment(process.env);
 
       logger.debug('Authenticating with Ghostfolio...');
-      const res = await this.axiosInstance.post(`${this.baseURL}/api/v1/auth/anonymous`, {
-        accessToken: env.GHOSTFOLIO_TOKEN,
+
+      const res = await trackApiRequest('ghostfolio', 'POST', async () => {
+        return this._apiRequest({
+          method: 'POST',
+          url: `${this.baseURL}/api/v1/auth/anonymous`,
+          data: {
+            accessToken: env.GHOSTFOLIO_TOKEN,
+          },
+        });
       });
 
       // Validate response structure
@@ -50,13 +137,16 @@ class GhostfolioAPI {
         typeof res.data.authToken !== 'string' ||
         res.data.authToken.length === 0
       ) {
+        AuditLogger.logAuth(false, { service: 'ghostfolio', reason: 'invalid_token' });
         throw new Error('Invalid authentication response: missing or empty authToken');
       }
 
       this.accessToken = res.data.authToken;
       logger.info('Successfully authenticated with Ghostfolio');
+      AuditLogger.logAuth(true, { service: 'ghostfolio' });
     } catch (error) {
       logger.error('Failed to authenticate with Ghostfolio', sanitizeError(error));
+      AuditLogger.logAuth(false, { service: 'ghostfolio', error: error.message });
       throw error;
     }
   }
@@ -66,12 +156,24 @@ class GhostfolioAPI {
       throw new Error('Not authenticated. Call authenticate() first');
     }
 
+    // Check cache first
+    const now = Date.now();
+    if (this.accountsCache && this.accountsCacheExpiry > now) {
+      logger.debug('Using cached Ghostfolio accounts');
+      return this.accountsCache;
+    }
+
     try {
       logger.debug('Fetching Ghostfolio accounts...');
-      const response = await this.axiosInstance.get(`${this.baseURL}/api/v1/account`, {
-        headers: {
-          Authorization: `Bearer ${this.accessToken}`,
-        },
+
+      const response = await trackApiRequest('ghostfolio', 'GET', async () => {
+        return this._apiRequest({
+          method: 'GET',
+          url: `${this.baseURL}/api/v1/account`,
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+          },
+        });
       });
 
       // Validate response structure
@@ -80,6 +182,10 @@ class GhostfolioAPI {
       if (!Array.isArray(response.data.accounts)) {
         throw new Error('Invalid API response: accounts must be an array');
       }
+
+      // Cache the results
+      this.accountsCache = response.data.accounts;
+      this.accountsCacheExpiry = now + this.cacheTTL;
 
       logger.info(`Found ${response.data.accounts.length} Ghostfolio accounts`);
       return response.data.accounts;
@@ -117,18 +223,27 @@ class GhostfolioAPI {
         platformId: ghostfolioAccount.platformId || null,
       };
 
-      const response = await this.axiosInstance.put(
-        `${this.baseURL}/api/v1/account/${ghostfolioAccount.id}`,
-        updateData,
-        {
+      const response = await trackApiRequest('ghostfolio', 'PUT', async () => {
+        return this._apiRequest({
+          method: 'PUT',
+          url: `${this.baseURL}/api/v1/account/${ghostfolioAccount.id}`,
+          data: updateData,
           headers: {
             Authorization: `Bearer ${this.accessToken}`,
             'Content-Type': 'application/json',
           },
-        }
-      );
+        });
+      });
 
       logger.info(`Successfully updated balance for account ${ghostfolioAccount.name}`);
+      AuditLogger.logBalanceUpdate(ghostfolioAccount.name, true, {
+        service: 'ghostfolio',
+      });
+
+      // Invalidate cache after update
+      this.accountsCache = null;
+      this.accountsCacheExpiry = null;
+
       return response.data;
     } catch (error) {
       logger.error(

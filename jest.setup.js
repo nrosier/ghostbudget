@@ -14,3 +14,8 @@ beforeEach(() => {
 
 // Set test environment
 process.env.NODE_ENV = 'test';
+
+// Mock uuid to avoid ESM issues in Jest
+jest.mock('uuid', () => ({
+  v4: jest.fn(() => 'test-uuid-1234'),
+}));
