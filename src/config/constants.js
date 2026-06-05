@@ -42,10 +42,6 @@ module.exports = {
   MAX_ACCOUNT_NAME_LENGTH: 255,
   MIN_PASSWORD_LENGTH: 1,
   MIN_TOKEN_LENGTH: 1,
-
-  // Metrics Configuration
-  METRICS_PORT: 3000,
-  HEALTH_CHECK_INTERVAL_MS: 30000, // 30 seconds
 };
 
 // Made with Bob

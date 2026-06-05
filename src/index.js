@@ -6,7 +6,6 @@ const ghostfolio = require('./ghostfolio');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
 const { sanitizeError } = require('./utils/validation');
-const { trackSyncDuration, recordSyncError, recordAccountsSynced } = require('./utils/metrics');
 
 // Track cleanup state
 let isShuttingDown = false;
@@ -55,38 +54,30 @@ async function sync() {
     logger.info('Starting sync process...', { timestamp: new Date().toISOString() });
     AuditLogger.logSync('started', { timestamp: new Date().toISOString() });
 
-    // Track sync duration with metrics
-    const result = await trackSyncDuration(async () => {
-      // Get balances from Actual Budget
-      logger.info('Fetching balances from Actual Budget...');
-      const balances = await getAccountBalances();
+    // Get balances from Actual Budget
+    logger.info('Fetching balances from Actual Budget...');
+    const balances = await getAccountBalances();
 
-      if (!balances || !Array.isArray(balances) || balances.length === 0) {
-        throw new Error('No balances received from Actual Budget');
-      }
+    if (!balances || !Array.isArray(balances) || balances.length === 0) {
+      throw new Error('No balances received from Actual Budget');
+    }
 
-      logger.info(`Found ${balances.length} accounts in Actual Budget`);
+    logger.info(`Found ${balances.length} accounts in Actual Budget`);
 
-      // Sync balances to Ghostfolio
-      logger.info('Syncing balances to Ghostfolio...');
-      await ghostfolio.syncAccountBalances(balances);
-
-      // Record successful sync metrics
-      recordAccountsSynced(balances.length);
-
-      return balances.length;
-    });
+    // Sync balances to Ghostfolio
+    logger.info('Syncing balances to Ghostfolio...');
+    await ghostfolio.syncAccountBalances(balances);
 
     const duration = Date.now() - startTime;
     logger.info('Sync completed successfully', {
       duration_ms: duration,
-      accounts_synced: result,
+      accounts_synced: balances.length,
       timestamp: new Date().toISOString(),
     });
 
     AuditLogger.logSync('completed', {
       duration_ms: duration,
-      accounts_synced: result,
+      accounts_synced: balances.length,
       timestamp: new Date().toISOString(),
     });
 
@@ -99,13 +90,11 @@ async function sync() {
       timestamp: new Date().toISOString(),
     });
 
-    // Record error metrics
     const errorType = error.message.includes('authentication')
       ? 'auth_error'
       : error.message.includes('network')
         ? 'network_error'
         : 'unknown_error';
-    recordSyncError(errorType);
 
     AuditLogger.logSync('failed', {
       error: error.message,

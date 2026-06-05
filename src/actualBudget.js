@@ -1,7 +1,6 @@
 const api = require('@actual-app/api');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
-const { trackApiRequest } = require('./utils/metrics');
 const constants = require('./config/constants');
 const {
   validateEnvironment,
@@ -18,12 +17,10 @@ async function getAccountBalances() {
     logger.debug('Initializing Actual Budget API...');
 
     // Initialize the Actual API client
-    await trackApiRequest('actualbudget', 'INIT', async () => {
-      await api.init({
-        dataDir: env.ACTUAL_BUDGET_DATA_DIR,
-        serverURL: env.ACTUAL_BUDGET_URL.replace(/\/$/, ''),
-        password: env.ACTUAL_BUDGET_PASS,
-      });
+    await api.init({
+      dataDir: env.ACTUAL_BUDGET_DATA_DIR,
+      serverURL: env.ACTUAL_BUDGET_URL.replace(/\/$/, ''),
+      password: env.ACTUAL_BUDGET_PASS,
     });
 
     logger.info('Successfully connected to Actual Budget server');

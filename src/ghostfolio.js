@@ -7,7 +7,6 @@ const CircuitBreaker = require('opossum');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
-const { trackApiRequest } = require('./utils/metrics');
 const constants = require('./config/constants');
 const {
   validateConfig,
@@ -119,14 +118,12 @@ class GhostfolioAPI {
 
       logger.debug('Authenticating with Ghostfolio...');
 
-      const res = await trackApiRequest('ghostfolio', 'POST', async () => {
-        return this._apiRequest({
-          method: 'POST',
-          url: `${this.baseURL}/api/v1/auth/anonymous`,
-          data: {
-            accessToken: env.GHOSTFOLIO_TOKEN,
-          },
-        });
+      const res = await this._apiRequest({
+        method: 'POST',
+        url: `${this.baseURL}/api/v1/auth/anonymous`,
+        data: {
+          accessToken: env.GHOSTFOLIO_TOKEN,
+        },
       });
 
       // Validate response structure
@@ -166,14 +163,12 @@ class GhostfolioAPI {
     try {
       logger.debug('Fetching Ghostfolio accounts...');
 
-      const response = await trackApiRequest('ghostfolio', 'GET', async () => {
-        return this._apiRequest({
-          method: 'GET',
-          url: `${this.baseURL}/api/v1/account`,
-          headers: {
-            Authorization: `Bearer ${this.accessToken}`,
-          },
-        });
+      const response = await this._apiRequest({
+        method: 'GET',
+        url: `${this.baseURL}/api/v1/account`,
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+        },
       });
 
       // Validate response structure
@@ -223,16 +218,14 @@ class GhostfolioAPI {
         platformId: ghostfolioAccount.platformId || null,
       };
 
-      const response = await trackApiRequest('ghostfolio', 'PUT', async () => {
-        return this._apiRequest({
-          method: 'PUT',
-          url: `${this.baseURL}/api/v1/account/${ghostfolioAccount.id}`,
-          data: updateData,
-          headers: {
-            Authorization: `Bearer ${this.accessToken}`,
-            'Content-Type': 'application/json',
-          },
-        });
+      const response = await this._apiRequest({
+        method: 'PUT',
+        url: `${this.baseURL}/api/v1/account/${ghostfolioAccount.id}`,
+        data: updateData,
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json',
+        },
       });
 
       logger.info(`Successfully updated balance for account ${ghostfolioAccount.name}`);

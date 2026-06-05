@@ -44,8 +44,6 @@ const envSchema = Joi.object({
   CACHE_TTL_MINUTES: Joi.number().integer().min(1).max(60).default(5),
   BATCH_SIZE: Joi.number().integer().min(1).max(50).default(10),
   MAX_RETRIES: Joi.number().integer().min(0).max(10).default(3),
-  METRICS_PORT: Joi.number().integer().min(1024).max(65535).default(3000),
-  ENABLE_METRICS: Joi.boolean().default(false),
 }).unknown(true); // Allow other env vars
 
 /**
