@@ -21,7 +21,7 @@
     "axios-retry": "^4.5.0",
     "dotenv": "17.4.2",
     "joi": "18.2.3",
-    "opossum": "^9.0.0",
+    "opossum": "^10.0.0",
     "rate-limiter-flexible": "^11.2.0",
     "uuid": "^14.0.1",
     "validator": "^13.15.35",
