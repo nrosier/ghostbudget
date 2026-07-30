@@ -57,21 +57,6 @@ class AuditLogger {
   }
 
   /**
-   * Log configuration change
-   * @param {string} changeType - Type of configuration change
-   * @param {Object} details - Additional details
-   */
-  static logConfigChange(changeType, details = {}) {
-    logger.info('Configuration change', {
-      event: 'config_change',
-      event_id: uuidv4(),
-      change_type: changeType,
-      timestamp: new Date().toISOString(),
-      ...details,
-    });
-  }
-
-  /**
    * Log security event
    * @param {string} eventType - Type of security event
    * @param {string} severity - Severity level (low, medium, high, critical)
@@ -86,27 +71,6 @@ class AuditLogger {
       severity,
       timestamp: new Date().toISOString(),
       ...details,
-    });
-  }
-
-  /**
-   * Log API request
-   * @param {string} service - Service name
-   * @param {string} method - HTTP method
-   * @param {string} endpoint - API endpoint
-   * @param {number} statusCode - Response status code
-   * @param {number} duration - Request duration in ms
-   */
-  static logApiRequest(service, method, endpoint, statusCode, duration) {
-    logger.debug('API request', {
-      event: 'api_request',
-      event_id: uuidv4(),
-      service,
-      method,
-      endpoint,
-      status_code: statusCode,
-      duration_ms: duration,
-      timestamp: new Date().toISOString(),
     });
   }
 
@@ -127,5 +91,3 @@ class AuditLogger {
 }
 
 module.exports = AuditLogger;
-
-// Made with Bob

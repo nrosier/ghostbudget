@@ -37,9 +37,6 @@ const envSchema = Joi.object({
   GHOSTFOLIO_TOKEN: Joi.string().min(constants.MIN_TOKEN_LENGTH).required(),
   LOG_LEVEL: Joi.string().valid('error', 'warn', 'info', 'debug').default('info'),
   NODE_ENV: Joi.string().valid('development', 'production', 'test').default('production'),
-  // New configuration options
-  REQUEST_SECRET: Joi.string().min(32).optional(),
-  GHOSTFOLIO_CERT_FINGERPRINT: Joi.string().hex().length(64).optional(),
   CACHE_TTL_MINUTES: Joi.number().integer().min(1).max(60).default(5),
   BATCH_SIZE: Joi.number().integer().min(1).max(50).default(10),
   MAX_RETRIES: Joi.number().integer().min(0).max(10).default(3),
@@ -191,5 +188,3 @@ module.exports = {
   sanitizeError,
   validateApiResponse,
 };
-
-// Made with Bob

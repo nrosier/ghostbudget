@@ -285,7 +285,8 @@ class GhostfolioAPI {
           throw new Error(`No matching Ghostfolio account found for ${ghostfolioAccountName}`);
         }
 
-        const factor = mapping.factor !== undefined ? validateBalance(mapping.factor) : 1;
+        // config validation guarantees factor is a positive number (default 1)
+        const factor = validateBalance(mapping.factor);
 
         await this.updateAccountBalance(ghostfolioAccount, actualAccount.balance, factor);
       } catch (error) {

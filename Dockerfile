@@ -50,5 +50,3 @@ ENV NODE_ENV=production \
 
 # Use entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
-
-# Made with Bob

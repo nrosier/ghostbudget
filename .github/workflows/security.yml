@@ -114,5 +114,3 @@ jobs:
           head: HEAD
           extra_args: --only-verified
         continue-on-error: true
-
-# Made with Bob

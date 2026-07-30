@@ -40,9 +40,8 @@ const logger = winston.createLogger({
     winston.format.timestamp(),
     winston.format.errors({ stack: true }),
     winston.format((info) => {
-      // Add correlation ID to all logs
+      // Add correlation ID to all logs (service/version come from defaultMeta)
       info.correlationId = correlationId;
-      info.service = 'ghostbudget';
       return info;
     })(),
     winston.format.json()

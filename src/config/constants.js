@@ -14,7 +14,6 @@ module.exports = {
   LOG_MAX_FILES: 5,
 
   // Performance Configuration
-  CACHE_TTL_MS: 5 * 60 * 1000, // 5 minutes
   BATCH_SIZE: 10, // Process accounts in batches of 10
   MAX_RETRIES: 3, // Maximum retry attempts
 
@@ -43,5 +42,3 @@ module.exports = {
   MIN_PASSWORD_LENGTH: 1,
   MIN_TOKEN_LENGTH: 1,
 };
-
-// Made with Bob

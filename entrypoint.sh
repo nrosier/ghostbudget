@@ -59,5 +59,3 @@ echo "NPM version: $(npm --version)"
 # Start cron in foreground and tail logs
 crond -f -l 2 &
 tail -f /var/log/cron.log
-
-# Made with Bob
