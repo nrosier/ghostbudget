@@ -1,5 +1,4 @@
 const Joi = require('joi');
-const validator = require('validator');
 const logger = require('../logger');
 const AuditLogger = require('./audit');
 const constants = require('../config/constants');
@@ -126,24 +125,27 @@ function validateAccountName(name) {
     throw new Error('Account name must be a non-empty string');
   }
 
-  // Sanitize HTML entities to prevent XSS
-  const sanitized = validator.escape(name.trim());
+  const trimmed = name.trim();
 
-  if (sanitized.length > constants.MAX_ACCOUNT_NAME_LENGTH) {
+  if (trimmed.length > constants.MAX_ACCOUNT_NAME_LENGTH) {
     AuditLogger.logValidationFailure('account_name', {
       reason: 'too_long',
-      length: sanitized.length,
+      length: trimmed.length,
     });
     throw new Error(`Account name must not exceed ${constants.MAX_ACCOUNT_NAME_LENGTH} characters`);
   }
 
-  // Check for suspicious patterns
-  if (/<script|javascript:|on\w+=/i.test(name)) {
+  // Reject obviously malicious payloads as defense-in-depth. Account names are
+  // used only as identifiers and serialized as JSON (never rendered as HTML),
+  // so we must NOT HTML-escape them here: escaping would corrupt legitimate
+  // names containing characters like & < > " ' and break account matching
+  // against the values returned by the Actual Budget and Ghostfolio APIs.
+  if (/<script|javascript:|on\w+=/i.test(trimmed)) {
     AuditLogger.logSecurityEvent('xss_attempt', 'high', { input: 'account_name' });
     throw new Error('Account name contains invalid characters');
   }
 
-  return sanitized;
+  return trimmed;
 }
 
 /**

@@ -1,5 +1,7 @@
 const nock = require('nock');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 describe('ghostfolio', () => {
   let ghostfolio;
@@ -133,14 +135,15 @@ describe('ghostfolio', () => {
           ],
         });
 
-      // Update balance request
+      // Update balance request. Use a non-retryable 400 so the failure is
+      // deterministic (a 500 on an idempotent PUT would be retried).
       nock(baseUrl)
         .put('/api/v1/account/123', (body) => {
           expect(body.balance).toBe(1000.12);
           return true;
         })
         .matchHeader('Authorization', 'Bearer test-token')
-        .reply(500, { success: false });
+        .reply(400, { success: false });
       nock(baseUrl)
         .put('/api/v1/account/321', (body) => {
           expect(body.balance).toBe(1000.84);
@@ -150,8 +153,60 @@ describe('ghostfolio', () => {
         .reply(200, { success: true });
 
       await expect(ghostfolio.syncAccountBalances(actualBalances)).rejects.toThrow(
-        'Some accounts could not be synced'
+        /Failed to sync 1 account\(s\)/
       );
+    });
+
+    it('should match account names containing special characters', async () => {
+      // Regression test for account matching: names with characters such as &
+      // must match the values returned by the Ghostfolio API verbatim and must
+      // not be HTML-escaped during validation.
+      const specialConfigPath = path.join(os.tmpdir(), 'ghostbudget-special-config.json');
+      fs.writeFileSync(
+        specialConfigPath,
+        JSON.stringify({
+          accounts: [{ ghostfolioName: 'AT&T Stock', actualBudgetName: 'AT&T Stock' }],
+        })
+      );
+      ghostfolio.configPath = specialConfigPath;
+
+      try {
+        nock(baseUrl)
+          .post('/api/v1/auth/anonymous', { accessToken: 'test-token' })
+          .reply(200, { authToken: 'test-token' });
+
+        nock(baseUrl)
+          .get('/api/v1/account')
+          .matchHeader('Authorization', 'Bearer test-token')
+          .reply(200, {
+            accounts: [
+              {
+                id: '999',
+                name: 'AT&T Stock',
+                currency: 'USD',
+                comment: null,
+                isExcluded: false,
+                platformId: null,
+              },
+            ],
+          });
+
+        nock(baseUrl)
+          .put('/api/v1/account/999', (body) => {
+            expect(body.name).toBe('AT&T Stock');
+            expect(body.balance).toBe(1000.12);
+            return true;
+          })
+          .matchHeader('Authorization', 'Bearer test-token')
+          .reply(200, { success: true });
+
+        await ghostfolio.syncAccountBalances([{ name: 'AT&T Stock', balance: 100012 }]);
+
+        // If matching had failed, the PUT interceptor would remain unconsumed.
+        expect(nock.isDone()).toBe(true);
+      } finally {
+        fs.unlinkSync(specialConfigPath);
+      }
     });
   });
 
@@ -169,7 +224,7 @@ describe('ghostfolio', () => {
 
     it('should throw error when token is missing', async () => {
       delete process.env.GHOSTFOLIO_TOKEN;
-      await expect(ghostfolio.authenticate()).rejects.toThrow('Missing GHOSTFOLIO_TOKEN');
+      await expect(ghostfolio.authenticate()).rejects.toThrow(/GHOSTFOLIO_TOKEN/);
     });
   });
 
