@@ -35,7 +35,7 @@
     "eslint-plugin-security": "4.0.1",
     "jest": "30.4.2",
     "jsdoc": "^4.0.5",
-    "nock": "14.0.16",
+    "nock": "14.0.17",
     "prettier": "3.9.6"
   },
   "engines": {
