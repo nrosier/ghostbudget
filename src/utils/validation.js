@@ -1,7 +1,39 @@
+const fs = require('fs');
+const path = require('path');
 const Joi = require('joi');
 const logger = require('../logger');
 const AuditLogger = require('./audit');
 const constants = require('../config/constants');
+
+/**
+ * Paths that must never be used as the Actual Budget data directory.
+ *
+ * The container entrypoint used to run `chown -R` against this value as root, so
+ * `ACTUAL_BUDGET_DATA_DIR=/` rewrote ownership across the whole filesystem. That
+ * chown is gone — the container no longer has a root phase — but the value still
+ * decides where a SQLite database is created and where the process demands write
+ * access, so pointing it at a system directory is never what an operator meant.
+ */
+const PROTECTED_DATA_DIRS = new Set([
+  '/',
+  '/bin',
+  '/boot',
+  '/dev',
+  '/etc',
+  '/home',
+  '/lib',
+  '/media',
+  '/mnt',
+  '/opt',
+  '/proc',
+  '/root',
+  '/run',
+  '/sbin',
+  '/srv',
+  '/sys',
+  '/usr',
+  '/var',
+]);
 
 /**
  * Schema for validating config.json structure
@@ -146,6 +178,70 @@ function validateAccountName(name) {
 }
 
 /**
+ * Validate the Actual Budget data directory.
+ *
+ * Called once at scheduler startup rather than per sync: a data directory that is
+ * missing or unwritable is a deployment fault, and failing at startup with the
+ * resolved path in the message beats an opaque SQLite error every night at 05:00.
+ * The old entrypoint silently skipped its `[ -d ]` guard when the path did not
+ * exist, and Actual then wrote to a location that was not persisted.
+ *
+ * @param {*} dir - Candidate directory (typically process.env.ACTUAL_BUDGET_DATA_DIR)
+ * @returns {string|undefined} Resolved absolute path, or undefined if unset
+ * @throws {Error} If the path is unusable
+ */
+function validateDataDir(dir) {
+  if (dir === undefined || dir === null || dir === '') {
+    return undefined;
+  }
+
+  if (typeof dir !== 'string') {
+    throw new Error(`ACTUAL_BUDGET_DATA_DIR must be a string, got ${typeof dir}`);
+  }
+
+  if (!path.isAbsolute(dir)) {
+    throw new Error(`ACTUAL_BUDGET_DATA_DIR must be an absolute path, got "${dir}"`);
+  }
+
+  const resolved = path.resolve(dir);
+
+  if (PROTECTED_DATA_DIRS.has(resolved)) {
+    AuditLogger.logValidationFailure('data_dir', { reason: 'protected_path' });
+    throw new Error(
+      `ACTUAL_BUDGET_DATA_DIR must not be a system directory, got "${resolved}". ` +
+        'Point it at a dedicated volume mount such as /actual-budget.'
+    );
+  }
+
+  let stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    throw new Error(
+      `ACTUAL_BUDGET_DATA_DIR "${resolved}" does not exist. ` +
+        'Create it, or mount a volume there before starting the container.'
+    );
+  }
+
+  if (!stats.isDirectory()) {
+    throw new Error(`ACTUAL_BUDGET_DATA_DIR "${resolved}" is not a directory`);
+  }
+
+  try {
+    fs.accessSync(resolved, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
+  } catch {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 'unknown';
+    throw new Error(
+      `ACTUAL_BUDGET_DATA_DIR "${resolved}" is not readable and writable by uid ${uid}. ` +
+        'The container runs as uid 1001; chown the volume to 1001:1001.'
+    );
+  }
+
+  logger.debug('Actual Budget data directory validated', { dataDir: resolved });
+  return resolved;
+}
+
+/**
  * Read a message from a thrown or rejected value of unknown shape.
  *
  * Not every rejection carries an Error: libraries reject with plain objects, and
@@ -220,6 +316,7 @@ module.exports = {
   validateEnvironment,
   validateBalance,
   validateAccountName,
+  validateDataDir,
   errorMessageOf,
   sanitizeError,
   validateApiResponse,

@@ -53,9 +53,16 @@ cp config.json.example config.json
 - `ACTUAL_BUDGET_URL`: URL of your Actual Budget server
 - `ACTUAL_BUDGET_PASS`: Your Actual Budget server password
 - `ACTUAL_BUDGET_SYNC_ID`: Your budget's sync ID
-- `ACTUAL_BUDGET_DATA_DIR`: Directory for Actual Budget data
+- `ACTUAL_BUDGET_DATA_DIR`: Directory for Actual Budget data. Must be an absolute
+  path to an existing, writable directory; the container sets this to the
+  `/actual-budget` volume mount.
 - `GHOSTFOLIO_URL`: URL of your Ghostfolio instance
 - `GHOSTFOLIO_TOKEN`: Your Ghostfolio access token
+- `CRON_TASK`: Schedule for the container's built-in scheduler (Docker only).
+  A five-field cron expression such as `0 5 * * *`, or one of `@hourly`,
+  `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
+  Six- and seven-field expressions are rejected: an extra leading field is read
+  as seconds, so `0 5 * * * *` would run hourly rather than daily.
 
 ### Account Mapping (config.json)
 
@@ -106,6 +113,34 @@ Logs are written to:
 - Console: Shows colored output for development
 
 ## Automated Execution
+
+### Using Docker (recommended)
+
+The container has its own scheduler — there is no `cron` inside the image and no
+host crontab to maintain. `docker compose up -d` is all that is needed:
+
+```bash
+cp .env.example .env          # fill in credentials
+mkdir -p config && cp config.json.example config/config.json
+docker compose up -d
+docker compose logs -f
+```
+
+On startup the scheduler validates `CRON_TASK` and `ACTUAL_BUDGET_DATA_DIR` and
+logs the next three run times, so a mistyped schedule is visible immediately
+rather than after a night of nothing happening. Each run is a separate process,
+so a failed sync cannot affect the next one, and runs never overlap.
+
+Check the container's health with:
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' ghostbudget
+docker exec ghostbudget node src/healthcheck.js
+```
+
+The health check reports on the scheduler, not on the last sync's outcome: a sync
+that fails because Actual Budget or Ghostfolio is unreachable is a problem to
+read in the logs, not a reason to restart the container.
 
 ### Using Cron
 

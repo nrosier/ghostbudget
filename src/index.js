@@ -5,44 +5,11 @@ const { getAccountBalances } = require('./actualBudget');
 const ghostfolio = require('./ghostfolio');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
-const constants = require('./config/constants');
+const { flushLogsAndExit } = require('./utils/exit');
 const { errorMessageOf, sanitizeError } = require('./utils/validation');
 
 // Track cleanup state
 let isShuttingDown = false;
-
-/**
- * Exit once Winston has flushed, rather than immediately.
- *
- * Winston's File transports write asynchronously, so calling process.exit()
- * directly after logger.error() discards whatever is still buffered — which is
- * exactly the failure reason and the audit event that make the log useful. Wait
- * for the logger to finish, but bound the wait so a stuck transport cannot leave
- * the container hanging.
- *
- * @param {number} code - Process exit code
- */
-function flushLogsAndExit(code) {
-  // Set immediately so the code is correct even if the process ends another way.
-  process.exitCode = code;
-
-  let exited = false;
-  const exit = () => {
-    if (exited) {
-      return;
-    }
-    exited = true;
-    process.exit(code);
-  };
-
-  const timer = setTimeout(exit, constants.LOG_FLUSH_TIMEOUT_MS);
-  if (typeof timer.unref === 'function') {
-    timer.unref();
-  }
-
-  logger.on('finish', exit);
-  logger.end();
-}
 
 /**
  * Graceful shutdown handler

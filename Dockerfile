@@ -1,52 +1,67 @@
-# Use specific Node.js version with Alpine for minimal attack surface
-# Pin to exact digest for immutability and security
-FROM node:lts-alpine
+# Node.js LTS on Alpine, pinned by digest rather than by tag.
+#
+# A tag is mutable: `node:lts-alpine` resolves to a different image over time, so
+# two builds of the same commit are not the same image and a compromised upstream
+# tag would be pulled silently. The digest below was resolved on 2026-08-13 and is
+# Node v24.19.0 on Alpine 3.24.1.
+#
+# To update: docker pull node:lts-alpine && \
+#            docker image inspect node:lts-alpine --format '{{index .RepoDigests 0}}'
+FROM node:lts-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
 
-# Install security updates, build tools for native modules, and create non-root user
-# Build tools are needed for better-sqlite3 (used by @actual-app/api)
+# tini becomes PID 1. It forwards SIGTERM/SIGINT to the scheduler so `docker stop`
+# is acted on immediately instead of waiting out the grace period, and it reaps
+# any process a sync leaves behind.
+#
+# Build tools are needed to compile better-sqlite3 (via @actual-app/api) and are
+# installed as a virtual package so they can be removed in the same layer.
 RUN apk upgrade --no-cache && \
-    apk add --no-cache python3 make g++ && \
+    apk add --no-cache tini && \
+    apk add --no-cache --virtual .build-deps python3 make g++ && \
     addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001 -G nodejs
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files with correct ownership
-COPY --chown=nodejs:nodejs package*.json ./
+COPY package*.json ./
 
 # Install dependencies with security best practices
-# - Use npm ci for reproducible builds
-# - Omit dev dependencies
-# - Allow scripts for native module compilation (better-sqlite3)
-# - Clean cache to reduce image size
+# - npm ci for reproducible builds
+# - omit dev dependencies
+# - clean cache to reduce image size
 RUN npm ci --omit=dev && \
     npm cache clean --force && \
-    apk del python3 make g++
+    apk del .build-deps
 
-# Copy application files with correct ownership
-COPY --chown=nodejs:nodejs . .
+# Application code is copied root-owned, so it is read-only to the account the
+# sync runs as. Previously this was `COPY --chown=nodejs:nodejs . .`, which let a
+# compromised sync or a malicious dependency rewrite src/ and persist across runs.
+COPY . .
 
-# Make entrypoint executable
-RUN chmod +x /app/entrypoint.sh
+# Only the paths the application must write to belong to nodejs:
+# - /app/logs        Winston's file transports
+# - /actual-budget   default Actual Budget data directory. A fresh named volume
+#                    mounted here inherits this ownership from the image, so the
+#                    container does not need a root phase to chown it.
+RUN mkdir -p /app/logs /actual-budget && \
+    chown nodejs:nodejs /app/logs /actual-budget && \
+    chmod 750 /app/logs /actual-budget
 
-# Create logs directory with correct permissions
-RUN mkdir -p /app/logs && \
-    chown -R nodejs:nodejs /app/logs
+# No root at runtime. The scheduler needs no privileges: it reads environment
+# variables, writes logs, and forks the sync as itself.
+USER nodejs
 
-# Note: We do NOT switch to nodejs user here
-# The entrypoint needs root to set up cron and will drop privileges itself
+# Verifies the scheduler is alive and still ticking, rather than that a process
+# exists. See src/healthcheck.js for why a failed sync is not unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["node", "/app/src/healthcheck.js"]
 
-# Add health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "process.exit(0)" || exit 1
-
-# Expose no ports (this is a cron job, not a server)
+# Expose no ports (this is a scheduled job, not a server)
 # EXPOSE directive intentionally omitted
 
 # Set secure environment defaults
 ENV NODE_ENV=production \
-    LOG_LEVEL=info
+    LOG_LEVEL=info \
+    ACTUAL_BUDGET_DATA_DIR=/actual-budget
 
-# Use entrypoint
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "node", "/app/src/scheduler.js"]

@@ -120,25 +120,47 @@ repository to stay informed.
 ### Secrets management ✅
 
 - Secrets (`ACTUAL_BUDGET_PASS`, `GHOSTFOLIO_TOKEN`) are read from environment
-  variables only and are **never written to disk**. The container
-  [entrypoint.sh](entrypoint.sh) writes only non-sensitive variables to
-  `/app/project_env.sh` (mode `600`, owned by the `nodejs` user).
+  variables only and are **never written to disk**. Nothing in the container
+  copies the environment to a file; the sync process inherits it directly from
+  the scheduler ([src/scheduler.js](src/scheduler.js)).
 - The access token is held in memory during a run and never logged.
+- `.env` and `config*.json` are excluded from the Docker build context
+  ([.dockerignore](.dockerignore)), so a local `docker build` cannot bake real
+  credentials into an image layer.
 
 ### Container security ✅
 
-- Alpine base image for a minimal attack surface, with security updates applied
-  at build time ([Dockerfile](Dockerfile)).
-- Dedicated non-root user (`nodejs`, uid/gid 1001); build toolchain removed
-  after native-module compilation; `npm ci --omit=dev` for reproducible,
-  production-only installs.
-- The container starts as root only to configure cron, then
-  [entrypoint.sh](entrypoint.sh) drops privileges and runs the sync as the
-  `nodejs` user.
-- `CRON_TASK` is regex-validated to prevent command injection
-  ([entrypoint.sh](entrypoint.sh)).
-- Health check configured; no ports exposed (this is a scheduled job, not a
-  server).
+- Alpine base image for a minimal attack surface, **pinned by `sha256` digest**
+  so a build of a given commit is reproducible and a mutated upstream tag cannot
+  be pulled silently. Security updates are applied at build time
+  ([Dockerfile](Dockerfile)).
+- **No root at runtime.** `USER nodejs` (uid/gid 1001) is set in the image and
+  the container has no root phase at all: the scheduler needs no privileges, so
+  `cap_drop: [ALL]` and `no-new-privileges` are set in
+  [docker-compose.yml](docker-compose.yml).
+- **Application code is read-only to the runtime account.** `/app` is copied
+  root-owned; only `/app/logs` and the data directory belong to `nodejs`, and the
+  container root filesystem is mounted `read_only` with a small tmpfs at `/tmp`.
+  A compromised sync cannot rewrite `src/` and persist across runs.
+- Build toolchain removed after native-module compilation; `npm ci --omit=dev`
+  for reproducible, production-only installs.
+- `tini` is PID 1, so `SIGTERM` from `docker stop` is forwarded to the scheduler,
+  which stops scheduling, gives an in-flight sync 8 s to finish, and exits.
+- `CRON_TASK` is parsed by `croner` and constrained to a five-field expression or
+  a known nickname ([src/scheduler.js](src/scheduler.js)). It is never
+  interpolated into a shell command line, so command injection is not reachable
+  by construction rather than by a character allowlist.
+- `ACTUAL_BUDGET_DATA_DIR` is validated at startup — absolute, not a system
+  directory, existing and writable — and no longer passed to a recursive `chown`
+  running as root ([src/utils/validation.js](src/utils/validation.js)).
+- The health check verifies the scheduler is alive and still ticking, via a
+  heartbeat it refreshes on a timer ([src/healthcheck.js](src/healthcheck.js)).
+  A failed sync is deliberately not unhealthy: restarting the container cannot
+  fix a remote outage, and doing so would convert someone else's downtime into a
+  crash loop.
+- Resource limits (CPU, memory) and `stop_grace_period` are set in
+  [docker-compose.yml](docker-compose.yml). No ports are exposed — this is a
+  scheduled job, not a server.
 
 ### CI/CD security ✅
 
@@ -215,9 +237,11 @@ scope them to the minimum permissions required.
 
 ### Base image pinning
 
-The [Dockerfile](Dockerfile) uses the `node:lts-alpine` tag rather than a
-pinned digest. For maximum supply-chain immutability, pin the base image to a
-specific `sha256` digest.
+The [Dockerfile](Dockerfile) pins `node:lts-alpine` to a `sha256` digest. This
+makes builds reproducible, but it also means base-image security updates are
+**not** picked up automatically: the digest has to be refreshed deliberately. The
+Dockerfile records the command that resolves a new one. Trivy runs daily in CI
+against the built image, which is what surfaces the need to update.
 
 ### What logs do and do not contain
 
@@ -230,8 +254,9 @@ access tokens, account balances, or stack traces.
 ## Remaining Improvements (Low Priority)
 
 1. **Token lifecycle management** — expiration checks and refresh handling.
-2. **Supply-chain hardening** — generate an SBOM, sign the container image, and
-   pin the base image to a digest.
+2. **Supply-chain hardening** — generate an SBOM and sign the container image.
+   (Base-image digest pinning and restricting Dependabot auto-merge to
+   patch-level updates of direct dependencies are done.)
 3. **Enhanced monitoring** — metrics/alerting on repeated auth failures and
    suspicious activity; optional syslog/HTTP log transport.
 4. **Expanded security testing** — integration/fuzz tests and SAST (e.g. Snyk,
@@ -244,18 +269,24 @@ security risk.
 
 ## Deployment Security Checklist
 
-Before deploying to production, ensure:
+Items marked ✅ are enforced by the image or by
+[docker-compose.yml](docker-compose.yml) and need no per-deployment action. The
+rest are the operator's responsibility.
 
+- ✅ The container runs as the non-root `nodejs` user (uid 1001), with
+  `cap_drop: [ALL]`, `no-new-privileges`, and a read-only root filesystem.
+- ✅ The base image is pinned to a `sha256` digest, not a tag.
+- ✅ Resource limits (CPU, memory) are configured.
+- ✅ The health check verifies the scheduler is actually running.
 - [ ] Secrets are stored in a secret manager, not committed `.env` files.
 - [ ] HTTPS is enforced for both API endpoints (required in production).
-- [ ] The container runs as the non-root `nodejs` user.
-- [ ] A specific base-image tag/digest is used (not `latest`).
+- [ ] The published image tag in `docker-compose.yml` is the one you intend to
+      run (it is pinned to a release, not `latest` — bump it deliberately).
 - [ ] Logs are aggregated and monitored.
-- [ ] Resource limits (CPU, memory) are configured.
 - [ ] Access tokens have been rotated and scoped to least privilege.
 - [ ] Network policies restrict container egress to the two API hosts.
 - [ ] `npm audit` and the CI security workflow pass.
-- [ ] The health check is configured and backups are tested.
+- [ ] The data volume is backed up, and restores have been tested.
 
 ---
 

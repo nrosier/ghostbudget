@@ -4,8 +4,10 @@
   "description": "Sync Actual Budget accounts with Ghostfolio",
   "main": "src/index.js",
   "scripts": {
+    "start": "node src/scheduler.js",
     "sync": "node src/index.js",
     "sync:debug": "LOG_LEVEL=debug node src/index.js",
+    "healthcheck": "node src/healthcheck.js",
     "test": "NODE_ENV=test jest",
     "test:watch": "NODE_ENV=test jest --watch",
     "test:coverage": "NODE_ENV=test jest --coverage",
@@ -19,6 +21,7 @@
     "@actual-app/api": "^26.7.0",
     "axios": "1.19.0",
     "axios-retry": "^4.5.0",
+    "croner": "10.0.1",
     "dotenv": "17.4.2",
     "joi": "18.2.3",
     "opossum": "^10.0.0",

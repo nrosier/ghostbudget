@@ -1,15 +1,56 @@
 services:
   ghostbudget:
-    image: niqck/ghostbudget:latest
+    # Pinned to a released tag, not :latest. With :latest, `docker compose up -d`
+    # or any container restart silently rolls out whatever was published most
+    # recently — including a build nobody reviewed.
+    image: niqck/ghostbudget:1.0.0
     container_name: ghostbudget
     restart: unless-stopped
+
+    # Hardening. The scheduler needs no privileges at all: it reads environment
+    # variables, writes logs, and forks the sync as itself.
+    user: '1001:1001' # Belt and braces; the image already sets USER nodejs
+    read_only: true # Application code cannot be modified at runtime
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Writable paths, needed because the root filesystem is read-only.
+    # The scheduler's health state file lives in /tmp.
+    tmpfs:
+      - /tmp:size=16m
+
+    # Resource limits. Compose v2 applies deploy.resources.limits for
+    # `docker compose up`; it is not Swarm-only.
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    # Long enough for the scheduler to stop an in-flight sync (8 s grace) and exit
+    # on its own terms rather than being SIGKILLed mid-write.
+    stop_grace_period: 30s
+
     volumes:
       - data:/actual-budget
+      - logs:/app/logs
       - ./config/config.json:/app/config.json:ro
+
     env_file:
       - .env
+
     environment:
       - CRON_TASK=${CRON_TASK:-0 5 * * *}
+      # Pinned to the volume mount below so the two cannot drift. .env.example
+      # previously suggested a placeholder path, and the old entrypoint skipped its
+      # directory check silently when that path did not exist — Actual Budget then
+      # wrote to a location that was not persisted, and every run started over.
+      - ACTUAL_BUDGET_DATA_DIR=/actual-budget
 
 volumes:
   data:
+  logs:

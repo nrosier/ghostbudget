@@ -3,6 +3,9 @@
  * Centralized configuration values for the application
  */
 
+const os = require('os');
+const path = require('path');
+
 // HTTP Configuration
 const HTTP_TIMEOUT_MS = 30000; // 30 seconds, per attempt
 const MAX_RETRIES = 3; // Maximum retry attempts
@@ -35,6 +38,20 @@ function circuitBreakerTimeoutFor(maxRetries = MAX_RETRIES) {
   );
 }
 
+/**
+ * Location of the scheduler's health state file.
+ *
+ * Read by both the scheduler (writer) and the health check (reader), so it has
+ * to be one shared definition. It lives in the temp directory rather than under
+ * /app so the container filesystem can be mounted read-only; the override exists
+ * for tests, which must not fight over a single fixed path.
+ *
+ * @returns {string} Absolute path to the health state file
+ */
+function healthStateFile() {
+  return process.env.GHOSTBUDGET_HEALTH_FILE || path.join(os.tmpdir(), 'ghostbudget-health.json');
+}
+
 module.exports = {
   // HTTP Configuration
   HTTP_TIMEOUT_MS,
@@ -50,6 +67,21 @@ module.exports = {
   BATCH_SIZE: 10, // Process accounts in batches of 10
   MAX_RETRIES,
   MAX_RETRY_DELAY_MS,
+
+  // Scheduler Configuration
+  // A sync that has not finished in 15 minutes is wedged: the whole request
+  // budget for one account is bounded by circuitBreakerTimeoutFor() above, so
+  // even a fully-retrying sync of 50 accounts finishes well inside this.
+  SYNC_TIMEOUT_MS: 15 * 60 * 1000,
+  SYNC_SIGKILL_GRACE_MS: 10 * 1000, // Grace between SIGTERM and SIGKILL
+  HEARTBEAT_INTERVAL_MS: 30 * 1000,
+  // Three missed heartbeats. Tolerates one slow write without reporting a
+  // healthy scheduler as dead.
+  HEALTH_MAX_STALE_MS: 90 * 1000,
+  // Kept under Docker's 10 s default stop timeout so an in-flight sync is asked
+  // to stop, and the scheduler still exits on its own terms, before SIGKILL.
+  SHUTDOWN_GRACE_MS: 8 * 1000,
+  healthStateFile,
 
   // Rate Limiting Configuration
   RATE_LIMIT_POINTS: 10, // 10 requests
