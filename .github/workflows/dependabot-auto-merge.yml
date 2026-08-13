@@ -1,84 +1,65 @@
 name: Dependabot Auto-merge
 
+# Only PATCH-level updates to DIRECT dependencies merge without human review.
+# Minor updates, major updates, and every transitive (indirect) update stay open
+# for a person to look at. This image holds Actual Budget and Ghostfolio
+# credentials, so an unreviewed transitive dependency must not be able to reach
+# production — main pushes publish :latest, which deployments consume.
 on:
   pull_request_target:
-  schedule:
-    # Run daily at 09:00 UTC to process any pending Dependabot PRs
-    - cron: '0 9 * * *'
-  workflow_dispatch: # Allow manual triggering
 
+# Read-only by default. The single job that needs write scopes requests them
+# itself, so nothing else in this workflow inherits them.
 permissions:
-  pull-requests: write
-  contents: write
+  contents: read
 
 jobs:
-  dependabot:
+  auto-merge:
+    name: Auto-merge patch updates to direct dependencies
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request_target' && github.actor == 'dependabot[bot]' }}
+    # Gate on the PR author rather than github.actor: it is the PR itself that
+    # must come from Dependabot, regardless of who triggered the run.
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
+      # Note: no checkout. pull_request_target runs with write access in the base
+      # repository context, so checking out PR head would execute untrusted code
+      # with those scopes.
       - name: Dependabot metadata
         id: metadata
         uses: dependabot/fetch-metadata@v2
         with:
-          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Auto-approve Dependabot PRs
-        if: ${{ steps.metadata.outputs.update-type != 'version-update:semver-major' }}
+      - name: Report decision
+        run: |
+          echo "Dependency:   $DEPENDENCY_NAMES"
+          echo "Update type:  $UPDATE_TYPE"
+          echo "Dep type:     $DEPENDENCY_TYPE"
+          echo "Eligible:     $ELIGIBLE"
+        env:
+          DEPENDENCY_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCY_TYPE: ${{ steps.metadata.outputs.dependency-type }}
+          ELIGIBLE: ${{ steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
+
+      # dependency-type is one of: direct:production, direct:development, indirect.
+      # Requiring the "direct:" prefix is what excludes transitive updates.
+      - name: Approve
+        if: ${{ steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
         run: gh pr review --approve "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for Dependabot PRs
-        if: ${{ steps.metadata.outputs.update-type != 'version-update:semver-major' }}
+      # --auto still requires all required status checks (lint, test, security) to
+      # pass before GitHub performs the merge.
+      - name: Enable auto-merge
+        if: ${{ steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
         run: gh pr merge --auto --merge "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  process-pending-prs:
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Process pending Dependabot PRs
-        run: |
-          echo "Checking for pending Dependabot PRs..."
-          
-          # Get all open PRs from Dependabot
-          gh pr list --author "app/dependabot" --state open --json number,title,url,labels --limit 100 > prs.json
-          
-          # Process each PR
-          jq -c '.[]' prs.json | while read -r pr; do
-            PR_NUMBER=$(echo "$pr" | jq -r '.number')
-            PR_URL=$(echo "$pr" | jq -r '.url')
-            PR_TITLE=$(echo "$pr" | jq -r '.title')
-            HAS_AUTOMERGE=$(echo "$pr" | jq -r '.labels[] | select(.name == "automerge") | .name')
-            
-            echo "Processing PR #$PR_NUMBER: $PR_TITLE"
-            
-            # Skip if it's a major update (contains "major" in title)
-            if echo "$PR_TITLE" | grep -qi "major"; then
-              echo "  Skipping major update - requires manual review"
-              continue
-            fi
-            
-            # Check if PR has automerge label
-            if [ -n "$HAS_AUTOMERGE" ]; then
-              echo "  Auto-approving PR #$PR_NUMBER"
-              gh pr review "$PR_NUMBER" --approve || echo "  Already approved or failed to approve"
-              
-              echo "  Enabling auto-merge for PR #$PR_NUMBER"
-              gh pr merge "$PR_NUMBER" --auto --merge || echo "  Auto-merge already enabled or failed"
-            else
-              echo "  Skipping - no automerge label"
-            fi
-          done
-          
-          echo "Finished processing Dependabot PRs"
-        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

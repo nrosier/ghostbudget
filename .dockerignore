@@ -29,6 +29,15 @@ SECURITY_AUDIT_REPORT.md
 .env.example
 config.json.example
 
+# Real secrets and configuration — these are gitignored, so they only ever exist
+# in a local working tree. Without these rules a local `docker build` bakes live
+# credentials into an image layer (the Dockerfile does `COPY . .`).
+.env
+.env.*
+**/.env
+config*.json
+**/config*.json
+
 # Logs
 logs/
 *.log

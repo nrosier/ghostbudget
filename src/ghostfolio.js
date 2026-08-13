@@ -4,7 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const CircuitBreaker = require('opossum');
-const { RateLimiterMemory } = require('rate-limiter-flexible');
+const { RateLimiterMemory, RateLimiterQueue } = require('rate-limiter-flexible');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
 const constants = require('./config/constants');
@@ -30,11 +30,19 @@ class GhostfolioAPI {
     this.accountsCacheExpiry = null;
     this.cacheTTL = (env.CACHE_TTL_MINUTES || 5) * 60 * 1000;
 
-    // Rate limiter
-    this.rateLimiter = new RateLimiterMemory({
-      points: constants.RATE_LIMIT_POINTS,
-      duration: constants.RATE_LIMIT_DURATION,
-    });
+    this.maxRetries = env.MAX_RETRIES ?? constants.MAX_RETRIES;
+
+    // Rate limiter. Wrapped in a queue so that exceeding the limit makes a request
+    // wait for the next slot instead of failing. A bare RateLimiterMemory rejects
+    // with a RateLimiterRes — not an Error — which breaks every downstream error
+    // path that reads `.message`, and turns a throttle into a lost balance update.
+    this.rateLimiter = new RateLimiterQueue(
+      new RateLimiterMemory({
+        points: constants.RATE_LIMIT_POINTS,
+        duration: constants.RATE_LIMIT_DURATION,
+      }),
+      { maxQueueSize: constants.RATE_LIMIT_MAX_QUEUE }
+    );
 
     // Create secure axios instance with enhanced TLS
     this.axiosInstance = axios.create({
@@ -55,10 +63,12 @@ class GhostfolioAPI {
       validateStatus: (status) => status >= 200 && status < 300,
     });
 
-    // Add retry logic with exponential backoff
+    // Add retry logic with exponential backoff, clamped so that the total time of a
+    // retry chain stays bounded (exponentialDelay honours an unbounded Retry-After).
     axiosRetry(this.axiosInstance, {
-      retries: env.MAX_RETRIES || constants.MAX_RETRIES,
-      retryDelay: axiosRetry.exponentialDelay,
+      retries: this.maxRetries,
+      retryDelay: (retryCount, error) =>
+        Math.min(axiosRetry.exponentialDelay(retryCount, error), constants.MAX_RETRY_DELAY_MS),
       retryCondition: (error) => {
         return (
           axiosRetry.isNetworkOrIdempotentRequestError(error) || error.response?.status === 429
@@ -72,9 +82,12 @@ class GhostfolioAPI {
       },
     });
 
-    // Create circuit breaker for API calls
+    // Create circuit breaker for API calls. The breaker wraps the entire retry
+    // chain, so its timeout is derived from that chain's worst case rather than
+    // being a fixed value shorter than it. Per-attempt cancellation is axios's
+    // own `timeout`, which aborts the socket; the breaker is the outer backstop.
     this.breaker = new CircuitBreaker(this._makeRequest.bind(this), {
-      timeout: constants.CIRCUIT_BREAKER_TIMEOUT,
+      timeout: constants.circuitBreakerTimeoutFor(this.maxRetries),
       errorThresholdPercentage: constants.CIRCUIT_BREAKER_ERROR_THRESHOLD,
       resetTimeout: constants.CIRCUIT_BREAKER_RESET_TIMEOUT,
     });
@@ -100,7 +113,7 @@ class GhostfolioAPI {
    * @private
    */
   async _makeRequest(config) {
-    await this.rateLimiter.consume('ghostfolio-api');
+    await this.rateLimiter.removeTokens(1);
     return this.axiosInstance(config);
   }
 

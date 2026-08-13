@@ -3,26 +3,62 @@
  * Centralized configuration values for the application
  */
 
+// HTTP Configuration
+const HTTP_TIMEOUT_MS = 30000; // 30 seconds, per attempt
+const MAX_RETRIES = 3; // Maximum retry attempts
+
+// Upper bound on a single retry backoff. axios-retry's exponentialDelay honours a
+// server's Retry-After header, which is unbounded — a misconfigured or hostile
+// server could otherwise stall a sync for minutes and make the total time of a
+// request chain impossible to bound.
+const MAX_RETRY_DELAY_MS = 8000;
+
+// Headroom on top of the retry budget for rate-limiter queueing and scheduling.
+const CIRCUIT_BREAKER_TIMEOUT_MARGIN_MS = 5000;
+
+/**
+ * Worst-case wall time for one fully-retried request chain, plus headroom.
+ *
+ * The circuit breaker wraps the whole axios-retry chain, so its timeout must
+ * exceed that chain's worst case. If it does not, the breaker fires on requests
+ * that are merely retrying: it records a failure, and — because opossum does not
+ * cancel the action it wrapped — the in-flight request continues and can still
+ * succeed, leaving the audit trail contradicting what actually happened.
+ *
+ * @param {number} maxRetries - Retries configured on the axios instance
+ * @returns {number} Timeout in milliseconds
+ */
+function circuitBreakerTimeoutFor(maxRetries = MAX_RETRIES) {
+  const attempts = maxRetries + 1;
+  return (
+    attempts * HTTP_TIMEOUT_MS + maxRetries * MAX_RETRY_DELAY_MS + CIRCUIT_BREAKER_TIMEOUT_MARGIN_MS
+  );
+}
+
 module.exports = {
   // HTTP Configuration
-  HTTP_TIMEOUT_MS: 30000, // 30 seconds
+  HTTP_TIMEOUT_MS,
   MAX_CONTENT_LENGTH_BYTES: 10 * 1024 * 1024, // 10MB
   MAX_BODY_LENGTH_BYTES: 10 * 1024 * 1024, // 10MB
 
   // Logging Configuration
   LOG_MAX_SIZE_BYTES: 10 * 1024 * 1024, // 10MB
   LOG_MAX_FILES: 5,
+  LOG_FLUSH_TIMEOUT_MS: 2000, // Bound the wait for Winston to flush on exit
 
   // Performance Configuration
   BATCH_SIZE: 10, // Process accounts in batches of 10
-  MAX_RETRIES: 3, // Maximum retry attempts
+  MAX_RETRIES,
+  MAX_RETRY_DELAY_MS,
 
   // Rate Limiting Configuration
   RATE_LIMIT_POINTS: 10, // 10 requests
   RATE_LIMIT_DURATION: 1, // per 1 second
+  RATE_LIMIT_MAX_QUEUE: 100, // Requests may wait for a slot rather than failing
 
   // Circuit Breaker Configuration
-  CIRCUIT_BREAKER_TIMEOUT: 30000, // 30 seconds
+  CIRCUIT_BREAKER_TIMEOUT_MARGIN_MS,
+  circuitBreakerTimeoutFor,
   CIRCUIT_BREAKER_ERROR_THRESHOLD: 50, // 50% error rate
   CIRCUIT_BREAKER_RESET_TIMEOUT: 30000, // 30 seconds
 

@@ -1,0 +1,344 @@
+# GhostBudget — Code Verification & Hardening Audit
+
+**Date:** 2026-08-13
+**Scope:** `src/`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yml`, `.dockerignore`, `.github/workflows/`, `package.json`, test suite
+**Commit reviewed:** `34dad94` (branch `main`, clean working tree)
+
+---
+
+## Baseline
+
+Every source file was read, and the following were executed against the working tree:
+
+| Check | Result |
+| ----- | ------ |
+| `npm test` | 12/12 passing, 2 suites |
+| `npm run lint` | Clean (exit 0) |
+| `npm audit --omit=dev` | 0 vulnerabilities |
+
+---
+
+## Empirically verified behaviours
+
+Five questions could not be settled by reading alone, so they were tested directly.
+
+| Question | Result |
+| -------- | ------ |
+| Do cron jobs receive the secrets that `entrypoint.sh` deliberately omits from `project_env.sh`? | **Yes.** BusyBox `crond` passes its own environment to jobs. Confirmed in a `node:lts-alpine` container: the job printed `SECRET_SEEN=[supersecret123]` without ever sourcing it. |
+| Does the rate limiter reject with an `Error`? | **No.** `rate-limiter-flexible/lib/RateLimiterMemory.js:31` calls `reject(res)` with a `RateLimiterRes` instance, which has no `.message` property. |
+| Does opossum's timeout cancel the in-flight request? | **No.** `opossum/lib/circuit.js:733-753` aborts the wrapped action only when `options.abortController` is supplied. It is not supplied here. |
+| Is `eslint-plugin-security` actually running? | **No.** It is not referenced in [eslint.config.js](eslint.config.js). Zero security rules execute. |
+| Is `@lavamoat/allow-scripts` installed? | **No.** `node_modules/@lavamoat` does not exist, so the `allowScripts` field in `package.json` is inert. |
+
+Two further behaviours were confirmed by direct test:
+
+- The `CRON_TASK` regex at [entrypoint.sh:12](entrypoint.sh#L12) correctly **rejects** `0 5 * * * ; rm -rf /` and `@daily`, and **accepts** `0 5 * * *` and the malformed `* * * * * * *`.
+- `better-sqlite3@12.11.1` is a native production dependency via `@actual-app/api`, so the build toolchain in the Dockerfile is genuinely required.
+
+---
+
+## Findings summary
+
+| # | Finding | Severity |
+| - | ------- | -------- |
+| 1 | `.dockerignore` does not exclude `.env` or `config.json` | High |
+| 2 | Circuit-breaker timeout is shorter than the retry budget it wraps | High |
+| 3 | Rate-limiter rejection has no `.message` | High |
+| 4 | `process.exit()` truncates Winston file transports | High |
+| 5 | Auto-merge ships dependency updates to production with no human review | High |
+| 6 | Runtime user owns the application code | Medium |
+| 7 | Container runs as root, and the docs say otherwise | Medium |
+| 8 | Secrets reach cron only via a BusyBox-specific quirk | Medium |
+| 9 | Health check verifies nothing | Medium |
+| 10 | No supervision, no signal forwarding | Medium |
+| 11 | Base image comment contradicts the code | Medium |
+| 12 | Unvalidated recursive `chown` on an operator-supplied path | Medium |
+| 13 | Compose file contradicts its own deployment checklist | Medium |
+| 14 | Cron regex accepts malformed schedules | Low |
+| 15 | `eslint-plugin-security` never runs | Medium |
+| 16 | `allowScripts` in `package.json` is dead config | Medium |
+| 17 | `MIN_PASSWORD_LENGTH` / `MIN_TOKEN_LENGTH` are `1` | Low |
+| 18 | TLS cipher allowlist can break handshakes and covers half the egress | Medium |
+| 19 | `sanitizeError` truncates but never redacts | Medium |
+| 20 | Balances are logged to disk outside production | Low |
+| 21 | Float money math | Low |
+| 22 | Full-object PUT can clobber fields | Medium |
+| 23 | Audit log always records `changed: true` | Low |
+| 24 | `validateBalance` doubles as the factor validator | Low |
+| 25 | The accounts cache is dead weight | Low |
+| 26 | Relative log path | Low |
+| 27 | CI scan gaps | Medium |
+| 28 | Test coverage gaps | Medium |
+
+---
+
+## Priority 1 — fix these first
+
+### 1. `.dockerignore` does not exclude `.env` or `config.json`
+
+[Dockerfile:28](Dockerfile#L28) does `COPY . .`, and [.dockerignore](.dockerignore) excludes `.env.example` and
+`config.json.example` but **not** `.env` or `config*.json`. Neither file exists in the current tree, and both are
+gitignored — which is exactly the trap: a maintainer who creates them for local testing bakes live credentials into a
+layer of a public image. CI builds are clean; local `docker build` is not.
+
+**Fix:** add `.env`, `.env.*`, `!.env.example`, and `config*.json` to `.dockerignore`. Highest value-per-character
+change in the repository.
+
+### 2. Circuit-breaker timeout is shorter than the retry budget it wraps
+
+`CIRCUIT_BREAKER_TIMEOUT: 30000` equals `HTTP_TIMEOUT_MS: 30000`
+([constants.js:8,25](src/config/constants.js#L8-L25)), but the breaker wraps `_makeRequest` — an axios instance
+carrying 3 retries with exponential backoff ([ghostfolio.js:59-80](src/ghostfolio.js#L59-L80)). One slow request plus a
+single retry already exceeds 30 s.
+
+Because opossum does not abort the wrapped action, **the PUT keeps running after the breaker has given up**. A balance
+write can therefore land at Ghostfolio after the code has recorded it as failed, so the audit trail diverges from
+reality. Cascading timeouts then trip the breaker at its 50 % threshold and fail every remaining account.
+
+**Fix:** set the breaker timeout above the worst-case retry chain (`HTTP_TIMEOUT_MS × (MAX_RETRIES + 1)` plus backoff),
+and pass an `AbortController` through to the axios `signal` option so a breaker timeout actually cancels the request.
+
+### 3. Rate-limiter rejection has no `.message`
+
+`this.rateLimiter.consume()` ([ghostfolio.js:103](src/ghostfolio.js#L103)) rejects with a non-`Error`. Two distinct
+consequences:
+
+- On the per-account path the failure degrades to `Failed to sync 1 account(s): undefined`
+  ([ghostfolio.js:294-299](src/ghostfolio.js#L294-L299)).
+- On the `authenticate()` / `getGhostfolioAccounts()` path ([ghostfolio.js:251-252](src/ghostfolio.js#L251-L252)) it
+  propagates raw to `error.message.includes('authentication')` at [index.js:93](src/index.js#L93) and throws a
+  **TypeError inside the catch block**, destroying both the real cause and the `sync failed` audit event.
+
+Separately: 10 req/s against sequential `await`s means the limiter almost never engages, and when it does it *throws*
+rather than queueing — converting a throttle into a hard failure.
+
+**Fix:** use `RateLimiterQueue` (or wrap `consume()` in a wait-and-retry), and make `sanitizeError` safe against
+non-`Error` values.
+
+### 4. `process.exit()` truncates Winston file transports
+
+Every exit path ([index.js:27,30,41,47,114,118](src/index.js#L27-L118)) calls `process.exit()` immediately after
+logging. Winston's File transport writes asynchronously, so the last and most important entries — the failure reason
+and the `sync failed` audit event — can be silently dropped. This undercuts the audit trail that
+[SECURITY.md:94-99](SECURITY.md#L94-L99) presents as a control.
+
+**Fix:** set `process.exitCode` and let the event loop drain, or call `logger.end()` and await the `finish` event
+before exiting.
+
+### 5. Auto-merge ships dependency updates to production with no human review
+
+[dependabot.yml](.github/dependabot.yml) labels *every* PR `automerge`; the scheduled `process-pending-prs` job in
+[dependabot-auto-merge.yml](.github/workflows/dependabot-auto-merge.yml) approves and merges anything so labelled,
+gated only by `grep -qi "major"` on the PR title — and `allow: dependency-type: "all"` includes transitive
+dependencies. [docker-image.yml](.github/workflows/docker-image.yml) then pushes `:latest` on every push to `main`,
+which [docker-compose.yml](docker-compose.yml) consumes.
+
+A compromised transitive package therefore reaches production untouched by a human. For a system holding financial
+credentials this is the most consequential gap in the repository.
+
+Note also that `on: pull_request_target` combined with `contents: write` is the dangerous trigger form. It is mitigated
+in the first job (no PR checkout, actor gated to `dependabot[bot]`), but the scheduled job re-implements the same
+auto-merge **without** the actor check.
+
+**Fix:** restrict auto-merge to patch-level direct dependencies, and drop `automerge` from the default label set.
+
+---
+
+## Priority 2 — container hardening
+
+### 6. Runtime user owns the application code
+
+[Dockerfile:28](Dockerfile#L28) `COPY --chown=nodejs:nodejs . .` makes all of `/app` writable by the account the sync
+runs as, so a compromised sync process (or a malicious dependency) can rewrite `src/` and persist across runs.
+
+**Fix:** copy the application root-owned and make only `logs/` writable by `nodejs`.
+
+### 7. Container runs as root, and the docs say otherwise
+
+There is no `USER` directive. PID 1, `crond`, and `tail -f` all run as root for the container's entire lifetime — only
+the *cron job* drops to `nodejs`. [SECURITY.md:128-137](SECURITY.md#L128-L137) and the checklist item "The container
+runs as the non-root `nodejs` user" ([SECURITY.md:251](SECURITY.md#L251)) are not accurate as written.
+
+### 8. Secrets reach cron only via a BusyBox-specific quirk
+
+Because BusyBox `crond` leaks its environment to jobs (verified above), `project_env.sh` buys no security at all, and
+the comment at [entrypoint.sh:40-41](entrypoint.sh#L40-L41) misdescribes what is happening.
+
+It is also a latent landmine: Vixie cron and cronie — used by any Debian-based base image — build a *clean* environment
+and would drop the secrets entirely, hard-failing at `validateEnvironment`.
+
+**Fix:** run the schedule in-process (`croner` / `node-cron`) under `USER nodejs`. That single change eliminates root,
+`project_env.sh`, `crond`, the privilege-drop dance, and this entire class of fragility at once.
+
+### 9. Health check verifies nothing
+
+[Dockerfile:41-42](Dockerfile#L41-L42) `node -e "process.exit(0)"` cannot fail. If `crond` dies, `tail -f` keeps PID 1
+alive and the container reports healthy indefinitely.
+
+**Fix:** `pgrep crond >/dev/null || exit 1`, plus a freshness check on the last successful sync.
+
+### 10. No supervision, no signal forwarding
+
+[entrypoint.sh:60-61](entrypoint.sh#L60-L61) backgrounds `crond` and foregrounds `tail`. PID 1 is a shell that does not
+forward `SIGTERM`, so `docker stop` always waits the full grace period and then `SIGKILL`s.
+
+**Fix:** `exec crond -f -l 2 -L /dev/stdout`, or add `tini` / `dumb-init` as PID 1.
+
+### 11. Base image comment contradicts the code
+
+[Dockerfile:2-3](Dockerfile#L2-L3) reads "Pin to exact digest for immutability and security" directly above a bare
+`FROM node:lts-alpine`. [SECURITY.md:216-220](SECURITY.md#L216-L220) correctly lists digest pinning as outstanding — it
+is the Dockerfile comment that is inaccurate.
+
+### 12. Unvalidated recursive `chown` on an operator-supplied path
+
+[entrypoint.sh:21](entrypoint.sh#L21) runs `chown -R` as root against whatever `ACTUAL_BUDGET_DATA_DIR` contains. The
+quoting is correct so there is no word-splitting bug, but `ACTUAL_BUDGET_DATA_DIR=/` would recursively chown the
+container filesystem.
+
+**Fix:** constrain the path to a known mount root and reject `/`, `/etc`, and similar.
+
+### 13. Compose file contradicts its own deployment checklist
+
+[SECURITY.md:254](SECURITY.md#L254) requires resource limits, but [docker-compose.yml](docker-compose.yml) sets no
+`mem_limit` / `cpus`, `read_only`, `cap_drop: [ALL]`, or `security_opt: no-new-privileges`, and pins `:latest`.
+
+There is also a configuration mismatch: compose mounts the volume at `/actual-budget` while
+[.env.example:5](.env.example#L5) suggests `/path/to/actual/data/directory`. Leaving the placeholder in place makes the
+`[ -d ]` guard at [entrypoint.sh:19](entrypoint.sh#L19) skip silently, and Actual then writes to a non-persistent path.
+
+### 14. Cron regex accepts malformed schedules
+
+[entrypoint.sh:12](entrypoint.sh#L12) correctly blocks injection, but has no field-count check — `* * * * * * *` passes
+validation and then misbehaves. It also rejects `@daily`, which is a reasonable thing for an operator to try.
+
+---
+
+## Priority 3 — controls that do not engage, and correctness issues
+
+### 15. `eslint-plugin-security` never runs
+
+The CI job at [security.yml:79-81](.github/workflows/security.yml#L79-L81) is named "Run ESLint with security plugin"
+and [SECURITY.md:150](SECURITY.md#L150) lists it as an implemented control, but the plugin is not registered in
+[eslint.config.js](eslint.config.js). `npm run lint` exits 0 having run zero security rules.
+
+### 16. `allowScripts` in `package.json` is dead config
+
+[package.json:41-45](package.json#L41-L45) carries `@lavamoat/allow-scripts` configuration without the package
+installed, so install scripts for `better-sqlite3`, `fsevents`, and `unrs-resolver` run unconditionally.
+
+**Fix:** either wire up `@lavamoat/allow-scripts` properly, or delete the field so it stops implying a control that
+does not exist.
+
+### 17. `MIN_PASSWORD_LENGTH` / `MIN_TOKEN_LENGTH` are `1`
+
+[constants.js:42-43](src/config/constants.js#L42-L43) are named like strength controls but only reject empty strings.
+`ACTUAL_BUDGET_PASS=x` validates successfully.
+
+### 18. TLS cipher allowlist can break handshakes and covers half the egress
+
+[constants.js:32-38](src/config/constants.js#L32-L38) permits only `ECDHE-RSA-*` suites for TLS 1.2. A Ghostfolio
+instance behind an **ECDSA** certificate — Let's Encrypt ECDSA, Cloudflare — negotiates `ECDHE-ECDSA-*` and will fail
+the handshake. The TLS 1.3 suite names in the list are inert: Node's `ciphers` option only governs TLS 1.2 and below.
+
+The agent is also applied only to the Ghostfolio client. `@actual-app/api` calls in
+[actualBudget.js](src/actualBudget.js) use Node defaults, so the "pinned cipher suite" control does not cover that leg
+of the egress.
+
+**Fix:** add `ECDHE-ECDSA-AES128-GCM-SHA256` and `ECDHE-ECDSA-AES256-GCM-SHA384`, or simply keep
+`minVersion: 'TLSv1.2'` with Node's defaults.
+
+### 19. `sanitizeError` truncates but never redacts
+
+[validation.js:153-160](src/utils/validation.js#L153-L160) passes `error.message` through verbatim; axios embeds
+request URLs and `@actual-app/api` can embed server responses. It also throws on `null` / `undefined`, which is
+reachable from the `unhandledRejection` handler at [index.js:40](src/index.js#L40).
+
+**Fix:** accept non-`Error` values, cap message length, and run a redaction pass over known secret values.
+
+### 20. Balances are logged to disk outside production
+
+[actualBudget.js:72-78](src/actualBudget.js#L72-L78) writes every account name and balance to `logs/combined.log` when
+`NODE_ENV !== 'production'`. [SECURITY.md:226](SECURITY.md#L226) states flatly that logs do not contain balances — true
+only in production.
+
+### 21. Float money math
+
+[ghostfolio.js:204](src/ghostfolio.js#L204) computes `(balance * factor) / 100`. With a non-integer factor,
+`100012 * 1.1 / 100` yields `1100.1320000000001`, which is PUT verbatim to a financial API.
+
+**Fix:** `Math.round(validatedBalance * validatedFactor) / 100`.
+
+### 22. Full-object PUT can clobber fields
+
+[ghostfolio.js:211-229](src/ghostfolio.js#L211-L229) hand-builds seven fields. Any field Ghostfolio's account model
+gains that is not in the list is sent absent — and on a PUT that is a reset, not a no-op.
+
+**Fix:** spread the fetched account instead: `{ ...ghostfolioAccount, balance: newBalance }`.
+
+### 23. Audit log always records `changed: true`
+
+[ghostfolio.js:232](src/ghostfolio.js#L232) hardcodes the value; nothing compares old to new, so the audit trail cannot
+distinguish real balance changes from no-ops.
+
+### 24. `validateBalance` doubles as the factor validator
+
+[ghostfolio.js:202,289](src/ghostfolio.js#L202) accepts negative and zero factors. The comment at
+[ghostfolio.js:288](src/ghostfolio.js#L288) claims validation guarantees positivity — true only through the Joi config
+path, not for direct callers of the public `updateAccountBalance`.
+
+### 25. The accounts cache is dead weight
+
+The cache is invalidated after every update ([ghostfolio.js:236-238](src/ghostfolio.js#L236-L238)) in a one-shot
+process, so `CACHE_TTL_MINUTES` never has any effect.
+
+### 26. Relative log path
+
+[logger.js:21,27](src/logger.js#L21) uses `logs/combined.log`, which resolves against the working directory. It only
+works because the crontab does `cd /app`, and Winston will not create a missing directory.
+
+### 27. CI scan gaps
+
+[security.yml:106,131](.github/workflows/security.yml#L106) use `trivy-action@master` and `trufflehog@main` — mutable
+refs with access to the workflow. Trivy has no `exit-code: '1'`, so a CRITICAL base-image CVE never blocks anything,
+and [docker-image.yml](.github/workflows/docker-image.yml) does not scan at all before pushing `:latest`.
+`npm audit --production` at [security.yml:41](.github/workflows/security.yml#L41) uses a deprecated flag; `--omit=dev`
+is current.
+
+### 28. Test coverage gaps
+
+[src/utils/validation.js](src/utils/validation.js) is the security boundary and has no direct tests; neither do
+`index.js`, `audit.js`, or `logger.js`. Nothing exercises the rate limiter or the circuit breaker despite both being
+claimed controls, and [jest.config.js](jest.config.js) sets no coverage thresholds.
+
+---
+
+## What is genuinely well done
+
+- Cron injection is properly blocked, and verified so by test.
+- Secrets are kept out of `project_env.sh`, which is written mode `600`.
+- `rejectUnauthorized: true` is set explicitly rather than relied on as a default.
+- HTTPS is enforced in production for both endpoints.
+- The build toolchain is removed in the same `RUN` layer that installs it, so it leaves no residue in the final layer.
+- Per-account failures are collected rather than aborting the whole run.
+- Correlation IDs and structured JSON logging are in place throughout.
+- The comment at [validation.js:135-139](src/utils/validation.js#L135-L139) explaining *why* account names are not
+  HTML-escaped is exactly the kind of reasoning that prevents a future regression — and there are tests pinning that
+  behaviour.
+
+---
+
+## Overall assessment
+
+The application code is solid and the security thinking behind it is real. The pattern worth attention is a gap between
+documented and actual posture:
+
+- Three documented controls do not engage at all — findings 15, 16, and 17.
+- Three claims in [SECURITY.md](SECURITY.md) are inaccurate against the code — findings 7, 11, and 20.
+
+Because `SECURITY.md` is the posture of record for this project, correcting it should be treated as part of the same
+work as the code fixes, not as a separate documentation task.
+
+**Suggested order of work:** findings 1–4 are small, self-contained diffs; finding 5 is a workflow configuration
+change. Finding 8 (replacing cron with an in-process scheduler) resolves findings 7, 10, and part of 6 as a side
+effect, so it is the highest-leverage structural change available.

@@ -6,6 +6,7 @@ const {
   validateEnvironment,
   validateBalance,
   validateAccountName,
+  errorMessageOf,
   sanitizeError,
 } = require('./utils/validation');
 
@@ -87,12 +88,16 @@ async function getAccountBalances() {
   } catch (error) {
     // Log sanitized error (no stack traces or sensitive data)
     logger.error('Error fetching account balances', sanitizeError(error));
+
+    // Read the message defensively — a non-Error rejection would otherwise throw
+    // a TypeError from inside this catch block and mask the real failure.
+    const message = errorMessageOf(error);
     AuditLogger.logAuth(false, {
       service: 'actualbudget',
-      error: error.message,
+      error: message,
     });
 
-    if (error.message.includes('Could not get remote files')) {
+    if (message.includes('Could not get remote files')) {
       logger.error('Connection failed. Verify server URL, sync ID, and credentials are correct');
     }
 

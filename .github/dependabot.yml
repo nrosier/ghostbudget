@@ -7,11 +7,13 @@ updates:
       day: "monday"
       time: "09:00"
 
-    # Labels for pull requests
+    # Labels for pull requests.
+    # Deliberately no "automerge" label: labelling every PR made auto-merge the
+    # default for all updates, including transitive ones. Eligibility is now
+    # decided from Dependabot metadata in dependabot-auto-merge.yml instead.
     labels:
       - "dependencies"
       - "npm"
-      - "automerge"
 
     # Maximum number of open PRs
     open-pull-requests-limit: 10
@@ -28,7 +30,9 @@ updates:
     # Version update strategy
     versioning-strategy: auto
 
-    # Allow both direct and indirect updates
+    # Allow both direct and indirect updates, so transitive security fixes still
+    # surface as PRs. Indirect updates are never auto-merged — see
+    # dependabot-auto-merge.yml — they just require a human to approve them.
     allow:
       - dependency-type: "all"
 

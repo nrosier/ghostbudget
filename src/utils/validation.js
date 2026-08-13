@@ -146,16 +146,51 @@ function validateAccountName(name) {
 }
 
 /**
+ * Read a message from a thrown or rejected value of unknown shape.
+ *
+ * Not every rejection carries an Error: libraries reject with plain objects, and
+ * the `unhandledRejection` handler can receive null or undefined. Classifying an
+ * error with `error.message.includes(...)` on such a value throws a TypeError
+ * from inside the catch block, destroying the original failure and the audit
+ * event that was about to be written. Always route through this helper.
+ *
+ * @param {*} value - Thrown or rejected value
+ * @returns {string} A message string, never undefined
+ */
+function errorMessageOf(value) {
+  if (value instanceof Error) {
+    return value.message;
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value !== null && typeof value === 'object' && typeof value.message === 'string') {
+    return value.message;
+  }
+  return `Non-error rejection of type ${value === null ? 'null' : typeof value}`;
+}
+
+/**
  * Sanitize error for logging (remove sensitive data)
- * @param {Error} error - Error object
+ * @param {*} error - Error object, or any thrown/rejected value
  * @returns {Object} Sanitized error object safe for logging
  */
 function sanitizeError(error) {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      code: error.code,
+      name: error.name,
+      // Explicitly exclude stack trace and other potentially sensitive data
+    };
+  }
+
+  // Non-Error values are described rather than serialized: stringifying an
+  // arbitrary object risks both circular references and leaking its contents.
   return {
-    message: error.message,
-    code: error.code,
-    name: error.name,
-    // Explicitly exclude stack trace and other potentially sensitive data
+    message: errorMessageOf(error),
+    code: typeof error?.code === 'string' ? error.code : undefined,
+    name: error?.constructor?.name || (error === null ? 'null' : typeof error),
   };
 }
 
@@ -185,6 +220,7 @@ module.exports = {
   validateEnvironment,
   validateBalance,
   validateAccountName,
+  errorMessageOf,
   sanitizeError,
   validateApiResponse,
 };
