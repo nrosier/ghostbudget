@@ -37,10 +37,32 @@ COPY package*.json ./
 # better-sqlite3 (via @actual-app/api) is a native module with no prebuilt binary
 # for Alpine's musl, so `npm rebuild` compiles it here against the virtual
 # build-deps, which are removed in the same layer.
+#
+# The package managers are then deleted, in this same layer so the bytes never
+# enter the image at all — the same reasoning as .build-deps above. Trivy scans
+# the whole filesystem, and the npm that ships in node:lts-alpine vendors its own
+# dependency tree: tar, brace-expansion, ip-address and undici there accounted
+# for every fixable CRITICAL/HIGH finding in this image, while the application's
+# own production tree was clean. Updating the base image does not fix it, because
+# the digest above is already the current node:lts-alpine, and `apk upgrade`
+# cannot touch npm, which is not an apk package.
+#
+# Nothing here needs them at runtime: the entrypoint is node, the healthcheck is
+# node, and the scheduler forks process.execPath. Removing them also drops yarn
+# and corepack, so a future CVE in either cannot fail the build for code that is
+# never executed. Use the /opt/yarn-* glob: a base image bundling a different
+# yarn patch version would otherwise leave yarn behind silently.
+#
+# To run a sync by hand in the container: docker exec <name> node src/index.js
 RUN npm ci --omit=dev --ignore-scripts && \
     npm rebuild better-sqlite3 && \
     npm cache clean --force && \
-    apk del .build-deps
+    apk del .build-deps && \
+    rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+           /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+           /root/.npm
 
 # Application code is copied root-owned, so it is read-only to the account the
 # sync runs as. Previously this was `COPY --chown=nodejs:nodejs . .`, which let a
