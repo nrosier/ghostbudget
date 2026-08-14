@@ -12,24 +12,28 @@ const { errorMessageOf, sanitizeError } = require('./utils/validation');
 let isShuttingDown = false;
 
 /**
- * Graceful shutdown handler
+ * Graceful shutdown handler.
+ *
+ * There is no cleanup step here, and the "add any cleanup logic here" placeholder
+ * that used to stand in for one — wrapped in a try/catch around a single log call,
+ * so the catch was unreachable — has gone with it. A sync owns nothing that this
+ * handler could release more safely than process exit does: the Actual Budget
+ * connection is closed by getAccountBalances before it returns, and an interrupted
+ * one is inside a native better-sqlite3 call that will not unwind on request.
+ *
+ * What the handler has to get right is exiting exactly once, and flushing the log
+ * before it does — both of which it still does.
+ *
+ * @param {string} signal - Signal that triggered the shutdown
  */
-async function gracefulShutdown(signal) {
+function gracefulShutdown(signal) {
   if (isShuttingDown) {
     return;
   }
 
   isShuttingDown = true;
-  logger.info(`Received ${signal}, shutting down gracefully...`);
-
-  try {
-    // Add any cleanup logic here (close connections, etc.)
-    logger.info('Cleanup completed');
-    flushLogsAndExit(0);
-  } catch (error) {
-    logger.error('Error during shutdown', sanitizeError(error));
-    flushLogsAndExit(1);
-  }
+  logger.info(`Received ${signal}, shutting down`);
+  flushLogsAndExit(0);
 }
 
 // Register shutdown handlers
@@ -52,9 +56,12 @@ process.on('uncaughtException', (error) => {
 async function sync() {
   const startTime = Date.now();
 
+  // No `timestamp` on any of the records below: winston's own format.timestamp()
+  // already puts one on every record, so passing another only produced two fields
+  // that had to agree.
   try {
-    logger.info('Starting sync process...', { timestamp: new Date().toISOString() });
-    AuditLogger.logSync('started', { timestamp: new Date().toISOString() });
+    logger.info('Starting sync process...');
+    AuditLogger.logSync('started');
 
     // Get balances from Actual Budget
     logger.info('Fetching balances from Actual Budget...');
@@ -71,26 +78,15 @@ async function sync() {
     await ghostfolio.syncAccountBalances(balances);
 
     const duration = Date.now() - startTime;
-    logger.info('Sync completed successfully', {
-      duration_ms: duration,
-      accounts_synced: balances.length,
-      timestamp: new Date().toISOString(),
-    });
+    const outcome = { duration_ms: duration, accounts_synced: balances.length };
 
-    AuditLogger.logSync('completed', {
-      duration_ms: duration,
-      accounts_synced: balances.length,
-      timestamp: new Date().toISOString(),
-    });
+    logger.info('Sync completed successfully', outcome);
+    AuditLogger.logSync('completed', outcome);
 
     return true;
   } catch (error) {
     const duration = Date.now() - startTime;
-    logger.error('Sync failed', {
-      ...sanitizeError(error),
-      duration_ms: duration,
-      timestamp: new Date().toISOString(),
-    });
+    logger.error('Sync failed', { ...sanitizeError(error), duration_ms: duration });
 
     // Read the message defensively: a non-Error rejection here would otherwise
     // throw a TypeError from inside this catch block and lose the audit event.
@@ -105,7 +101,6 @@ async function sync() {
       error: message,
       error_type: errorType,
       duration_ms: duration,
-      timestamp: new Date().toISOString(),
     });
 
     throw error;

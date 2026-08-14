@@ -1,10 +1,22 @@
 /**
  * Audit logging for security events
  * Tracks authentication, authorization, and data changes
+ *
+ * Every method here is a thin, named wrapper over one winston call. The value is
+ * the vocabulary — a fixed set of `event` names and payload shapes, chosen in one
+ * place rather than spelled out at thirty call sites — and the level routing, which
+ * decides whether an event reaches logs/error.log at all.
+ *
+ * Each payload used to also carry `timestamp: new Date().toISOString()` and an
+ * `event_id` UUID. The timestamp duplicated the one winston's own
+ * `format.timestamp()` already puts on every record, and the id was a second
+ * identifier alongside the per-process `correlationId` from logger.js, with nothing
+ * consuming it: there is no separate audit sink, and no query that needs to address
+ * one event rather than one run. Both are gone; `uuid` left the dependency list
+ * with them.
  */
 
 const logger = require('../logger');
-const { v4: uuidv4 } = require('uuid');
 
 class AuditLogger {
   /**
@@ -15,9 +27,7 @@ class AuditLogger {
   static logAuth(success, details = {}) {
     logger.info('Authentication attempt', {
       event: 'auth',
-      event_id: uuidv4(),
       success,
-      timestamp: new Date().toISOString(),
       service: details.service || 'unknown',
       ...details,
     });
@@ -32,10 +42,8 @@ class AuditLogger {
   static logBalanceUpdate(account, changed, details = {}) {
     logger.info('Balance update', {
       event: 'balance_update',
-      event_id: uuidv4(),
       account,
       changed,
-      timestamp: new Date().toISOString(),
       ...details,
     });
   }
@@ -46,13 +54,7 @@ class AuditLogger {
    * @param {Object} details - Additional details
    */
   static logSync(status, details = {}) {
-    const payload = {
-      event: 'sync',
-      event_id: uuidv4(),
-      status,
-      timestamp: new Date().toISOString(),
-      ...details,
-    };
+    const payload = { event: 'sync', status, ...details };
 
     // Branching rather than logger[level](): a computed method name on an object
     // is the pattern that turns a tainted string into an arbitrary call, and
@@ -71,14 +73,7 @@ class AuditLogger {
    * @param {Object} details - Additional details
    */
   static logSecurityEvent(eventType, severity, details = {}) {
-    const payload = {
-      event: 'security',
-      event_id: uuidv4(),
-      event_type: eventType,
-      severity,
-      timestamp: new Date().toISOString(),
-      ...details,
-    };
+    const payload = { event: 'security', event_type: eventType, severity, ...details };
 
     if (severity === 'critical' || severity === 'high') {
       logger.error('Security event', payload);
@@ -95,9 +90,7 @@ class AuditLogger {
   static logValidationFailure(validationType, details = {}) {
     logger.warn('Validation failure', {
       event: 'validation_failure',
-      event_id: uuidv4(),
       validation_type: validationType,
-      timestamp: new Date().toISOString(),
       ...details,
     });
   }

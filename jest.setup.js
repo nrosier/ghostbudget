@@ -15,7 +15,6 @@ beforeEach(() => {
 // Set test environment
 process.env.NODE_ENV = 'test';
 
-// Mock uuid to avoid ESM issues in Jest
-jest.mock('uuid', () => ({
-  v4: jest.fn(() => 'test-uuid-1234'),
-}));
+// The `uuid` package used to be mocked here, because it ships as ESM and Jest
+// could not load it. Correlation IDs now come from crypto.randomUUID(), which
+// needs neither the mock nor the transformIgnorePatterns entry in jest.config.js.

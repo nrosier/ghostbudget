@@ -71,5 +71,37 @@ describe('actualBudget', () => {
 
       await expect(actualBudget.getAccountBalances()).rejects.toThrow('Connection failed');
     });
+
+    it('rejects an account list that is not an array', async () => {
+      // Everything downstream maps over this value. Without the guard, a non-array
+      // reaches .map() and fails as a TypeError about `map` rather than about the
+      // response that was actually wrong.
+      api.init.mockResolvedValue();
+      api.downloadBudget.mockResolvedValue();
+      api.shutdown.mockResolvedValue();
+
+      for (const accounts of [null, undefined, { accounts: [] }, 'one']) {
+        api.getAccounts.mockResolvedValue(accounts);
+
+        await expect(actualBudget.getAccountBalances()).rejects.toThrow(
+          /expected array|Invalid response from getAccounts/
+        );
+      }
+
+      expect(api.getAccountBalance).not.toHaveBeenCalled();
+    });
+
+    it('points at the likely cause when the remote files cannot be listed', async () => {
+      // This is what a wrong sync ID or a wrong password looks like coming out of
+      // @actual-app/api, and the raw message says nothing about either.
+      api.init.mockRejectedValue(new Error('Could not get remote files'));
+
+      const logger = require('../src/logger');
+      const error = jest.spyOn(logger, 'error').mockImplementation(() => {});
+
+      await expect(actualBudget.getAccountBalances()).rejects.toThrow(/Could not get remote files/);
+
+      expect(error).toHaveBeenCalledWith(expect.stringMatching(/Verify server URL, sync ID/));
+    });
   });
 });

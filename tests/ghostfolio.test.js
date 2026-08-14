@@ -165,6 +165,59 @@ describe('ghostfolio', () => {
       );
     });
 
+    it('attempts every account and reports each real error when many fail', async () => {
+      // Regression test for the circuit breaker that used to wrap this client. It
+      // opened at a 50% error rate over the shared request stream, so on a run like
+      // this one — auth and the account fetch succeed, then the PUTs fail — the
+      // third failure opened it and every account after that was rejected locally
+      // with "Breaker is open": never sent, and its real error replaced in both the
+      // summary and the audit trail. Four stale mappings became a wall.
+      const manyConfigPath = path.join(os.tmpdir(), 'ghostbudget-many-config.json');
+      const names = ['Acct A', 'Acct B', 'Acct C', 'Acct D'];
+      fs.writeFileSync(
+        manyConfigPath,
+        JSON.stringify({
+          accounts: names.map((name) => ({ ghostfolioName: name, actualBudgetName: name })),
+        })
+      );
+      ghostfolio.configPath = manyConfigPath;
+
+      try {
+        nock(baseUrl).post('/api/v1/auth/anonymous', { accessToken }).reply(200, { authToken });
+        nock(baseUrl)
+          .get('/api/v1/account')
+          .reply(200, {
+            accounts: names.map((name, i) => ({
+              id: `id-${i}`,
+              name,
+              currency: 'USD',
+              comment: null,
+              platformId: null,
+            })),
+          });
+
+        // 400 rather than 500: axios-retry does not retry it, so each account is
+        // exactly one deterministic failure.
+        for (let i = 0; i < names.length; i += 1) {
+          nock(baseUrl).put(`/api/v1/account/id-${i}`).reply(400, { success: false });
+        }
+
+        const error = await ghostfolio
+          .syncAccountBalances(names.map((name) => ({ name, balance: 100012 })))
+          .then(() => null)
+          .catch((err) => err);
+
+        expect(error.message).toMatch(/Failed to sync 4 account\(s\)/);
+        expect(error.message).not.toMatch(/Breaker is open/i);
+        expect(error.message.match(/status code 400/g)).toHaveLength(4);
+        // Every PUT was actually sent — an unconsumed interceptor means an account
+        // was skipped rather than attempted and refused.
+        expect(nock.isDone()).toBe(true);
+      } finally {
+        fs.unlinkSync(manyConfigPath);
+      }
+    });
+
     it('should match account names containing special characters', async () => {
       // Regression test for account matching: names with characters such as &
       // must match the values returned by the Ghostfolio API verbatim and must
@@ -228,9 +281,43 @@ describe('ghostfolio', () => {
       expect(ghostfolio.accessToken).toBe('received-token');
     });
 
-    it('should throw error when token is missing', async () => {
+    it('refuses to construct the client at all when the token is missing', () => {
+      // This used to assert that authenticate() rejected, which it did because
+      // authenticate() re-ran the whole environment schema on every call — so the
+      // test could delete the variable after the client already existed. The real
+      // guarantee is the one README states: the process refuses to start rather
+      // than starting with a configuration that cannot work.
+      jest.resetModules();
       delete process.env.GHOSTFOLIO_TOKEN;
-      await expect(ghostfolio.authenticate()).rejects.toThrow(/GHOSTFOLIO_TOKEN/);
+
+      expect(() => require('../src/ghostfolio')).toThrow(/GHOSTFOLIO_TOKEN/);
+    });
+
+    it('sends the security token from the environment, not the auth token', async () => {
+      // The two are different values on purpose: the security token is exchanged
+      // for a short-lived authToken, and sending the wrong one of the two is a
+      // mistake a shared fixture would hide.
+      nock(baseUrl)
+        .post('/api/v1/auth/anonymous', { accessToken })
+        .reply(200, { authToken: 'received-token' });
+
+      await ghostfolio.authenticate();
+
+      expect(nock.isDone()).toBe(true);
+    });
+
+    it('rejects an auth response whose authToken is absent, null or empty', async () => {
+      // The presence check that fronted this (validateApiResponse) is gone, so the
+      // stricter one that always followed it has to carry the case on its own —
+      // including a null body, which would otherwise be a TypeError from here.
+      for (const body of [{}, { authToken: null }, { authToken: '' }, { authToken: 42 }, null]) {
+        nock.cleanAll();
+        nock(baseUrl).post('/api/v1/auth/anonymous').reply(200, body);
+
+        await expect(ghostfolio.authenticate()).rejects.toThrow(
+          /missing or empty authToken|Invalid authentication response/
+        );
+      }
     });
   });
 
@@ -262,6 +349,20 @@ describe('ghostfolio', () => {
     it('should throw when not authenticated', async () => {
       ghostfolio.accessToken = null;
       await expect(ghostfolio.getGhostfolioAccounts()).rejects.toThrow('Not authenticated');
+    });
+
+    it('rejects a body whose accounts field is missing, null or not an array', async () => {
+      // One check does all of this now that validateApiResponse no longer fronts it:
+      // `'accounts' in body` was satisfied by a string, and a null body would throw
+      // a TypeError here without the optional chaining.
+      for (const body of [{}, { accounts: null }, { accounts: 'two' }, null]) {
+        nock.cleanAll();
+        nock(baseUrl).get('/api/v1/account').reply(200, body);
+
+        await expect(ghostfolio.getGhostfolioAccounts()).rejects.toThrow(
+          /accounts must be an array/
+        );
+      }
     });
   });
 

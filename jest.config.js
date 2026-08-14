@@ -6,8 +6,6 @@ module.exports = {
   moduleDirectories: ['node_modules', 'src'],
   verbose: true,
   setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
-  // Transform ESM modules from node_modules
-  transformIgnorePatterns: ['node_modules/(?!(uuid)/)'],
 
   // Report on every source file, not only the ones a test happened to import: a
   // module with no test at all is exactly what a coverage report should surface,
@@ -24,14 +22,17 @@ module.exports = {
   // src/healthcheck.js, src/index.js, src/scheduler.js and src/utils/exit.js.
   coverageThreshold: {
     global: {
-      statements: 92,
-      branches: 88,
-      functions: 88,
-      lines: 92,
+      statements: 96,
+      branches: 91,
+      // 91.89 is the ceiling, not a gap to close: the shortfall is index.js's
+      // `require.main === module` block, whose two callbacks cannot run in a module
+      // a test has required. Reaching them means spawning a subprocess.
+      functions: 91,
+      lines: 96,
     },
     './src/utils/validation.js': {
       statements: 100,
-      branches: 95,
+      branches: 97,
       functions: 100,
       lines: 100,
     },
@@ -47,17 +48,17 @@ module.exports = {
       functions: 100,
       lines: 100,
     },
-    // The remaining gaps here are retry and circuit-breaker paths that need a real
-    // clock to reach; the resilience suite covers the behaviour, not every branch.
+    // The remaining gaps here are axios-retry's backoff paths, which need a real
+    // clock to reach. Raise these to whatever the suite currently achieves.
     './src/ghostfolio.js': {
-      statements: 88,
-      branches: 82,
-      functions: 82,
-      lines: 88,
+      statements: 93,
+      branches: 88,
+      functions: 83,
+      lines: 93,
     },
     './src/config/': {
       statements: 100,
-      branches: 60,
+      branches: 75,
       functions: 100,
       lines: 100,
     },

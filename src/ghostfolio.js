@@ -6,8 +6,6 @@ const axiosRetry = require('axios-retry').default;
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const CircuitBreaker = require('opossum');
-const { RateLimiterMemory, RateLimiterQueue } = require('rate-limiter-flexible');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
 const constants = require('./config/constants');
@@ -19,7 +17,6 @@ const {
   validateAccountName,
   errorMessageOf,
   sanitizeError,
-  validateApiResponse,
 } = require('./utils/validation');
 
 /**
@@ -51,25 +48,20 @@ const UPDATABLE_ACCOUNT_FIELDS = ['comment', 'currency', 'id', 'name'];
 
 class GhostfolioAPI {
   constructor() {
-    // Validate environment on construction
+    // Validated once, here. The environment cannot change under a running process,
+    // and every value this client needs is taken from the result — authenticate()
+    // used to re-run the whole schema on each call for the sake of one field.
     const env = validateEnvironment(process.env);
     this.baseURL = env.GHOSTFOLIO_URL.replace(/\/$/, '');
+    // Ghostfolio's anonymous-user security token, exchanged for a short-lived
+    // authToken by authenticate(). `accessToken` below holds that authToken.
+    this.securityToken = env.GHOSTFOLIO_TOKEN;
     this.accessToken = null;
     this.configPath = path.join(__dirname, '..', 'config.json');
 
-    this.maxRetries = env.MAX_RETRIES ?? constants.MAX_RETRIES;
-
-    // Rate limiter. Wrapped in a queue so that exceeding the limit makes a request
-    // wait for the next slot instead of failing. A bare RateLimiterMemory rejects
-    // with a RateLimiterRes — not an Error — which breaks every downstream error
-    // path that reads `.message`, and turns a throttle into a lost balance update.
-    this.rateLimiter = new RateLimiterQueue(
-      new RateLimiterMemory({
-        points: constants.RATE_LIMIT_POINTS,
-        duration: constants.RATE_LIMIT_DURATION,
-      }),
-      { maxQueueSize: constants.RATE_LIMIT_MAX_QUEUE }
-    );
+    // A local, not a field: the only reader is the axiosRetry call below. As
+    // `this.maxRetries` it looked like state something outside might consult.
+    const maxRetries = env.MAX_RETRIES ?? constants.MAX_RETRIES;
 
     // Create secure axios instance with enhanced TLS
     this.axiosInstance = axios.create({
@@ -82,10 +74,11 @@ class GhostfolioAPI {
         // cipher allowlist was removed rather than extended.
         minVersion: constants.TLS_MIN_VERSION,
         maxVersion: constants.TLS_MAX_VERSION,
+        // A sync issues its requests one at a time, so the pool never holds more
+        // than one socket and sizing it is meaningless. keepAlive is the part that
+        // earns its place: it reuses that socket instead of re-handshaking TLS for
+        // every account.
         keepAlive: true,
-        keepAliveMsecs: 30000,
-        maxSockets: 50,
-        maxFreeSockets: 10,
       }),
       validateStatus: (status) => status >= 200 && status < 300,
     });
@@ -93,7 +86,7 @@ class GhostfolioAPI {
     // Add retry logic with exponential backoff, clamped so that the total time of a
     // retry chain stays bounded (exponentialDelay honours an unbounded Retry-After).
     axiosRetry(this.axiosInstance, {
-      retries: this.maxRetries,
+      retries: maxRetries,
       retryDelay: (retryCount, error) =>
         Math.min(axiosRetry.exponentialDelay(retryCount, error), constants.MAX_RETRY_DELAY_MS),
       retryCondition: (error) => {
@@ -109,76 +102,50 @@ class GhostfolioAPI {
       },
     });
 
-    // Create circuit breaker for API calls. The breaker wraps the entire retry
-    // chain, so its timeout is derived from that chain's worst case rather than
-    // being a fixed value shorter than it. Per-attempt cancellation is axios's
-    // own `timeout`, which aborts the socket; the breaker is the outer backstop.
-    this.breaker = new CircuitBreaker(this._makeRequest.bind(this), {
-      timeout: constants.circuitBreakerTimeoutFor(this.maxRetries),
-      errorThresholdPercentage: constants.CIRCUIT_BREAKER_ERROR_THRESHOLD,
-      resetTimeout: constants.CIRCUIT_BREAKER_RESET_TIMEOUT,
-    });
-
-    this.breaker.on('open', () => {
-      logger.error('Circuit breaker opened - too many failures');
-      AuditLogger.logSecurityEvent('circuit_breaker_open', 'high', {
-        service: 'ghostfolio',
-      });
-    });
-
-    this.breaker.on('halfOpen', () => {
-      logger.info('Circuit breaker half-open - testing recovery');
-    });
-
-    this.breaker.on('close', () => {
-      logger.info('Circuit breaker closed - service recovered');
-    });
-  }
-
-  /**
-   * Make rate-limited API request
-   * @private
-   */
-  async _makeRequest(config) {
-    await this.rateLimiter.removeTokens(1);
-    return this.axiosInstance(config);
-  }
-
-  /**
-   * Make API request with circuit breaker and rate limiting
-   * @private
-   */
-  async _apiRequest(config) {
-    return this.breaker.fire(config);
+    // Retry is the only resilience layer here, and deliberately so.
+    //
+    // There was a rate limiter and a circuit breaker wrapped around this instance.
+    // Neither could do its job in this process, and the breaker did active harm.
+    //
+    // The limiter allowed 10 requests per second, but a sync issues its requests
+    // strictly sequentially — `await` per account in syncAccountBalances — so at
+    // most one is ever in flight. One-at-a-time is a tighter bound than 10/s, and
+    // the queue in front of it never queued anything.
+    //
+    // The breaker opened at a 50% error rate over the shared request stream. In a
+    // run where authentication and the account fetch succeed and then some account
+    // PUTs fail — a couple of stale mappings, say — the third failure opened it,
+    // and from that point every remaining account was rejected locally with
+    // "Breaker is open". So three bad mappings stopped the accounts behind them
+    // from being written at all, and replaced each one's real Ghostfolio error in
+    // the summary and the audit trail with the breaker's own message. Its 30 s
+    // resetTimeout could not help: a sync is a one-shot process that exits long
+    // before it elapses. The wall-clock backstop is the scheduler's
+    // SYNC_TIMEOUT_MS, which bounds the whole run and escalates to SIGKILL.
   }
 
   async authenticate() {
     try {
-      const env = validateEnvironment(process.env);
-
       logger.debug('Authenticating with Ghostfolio...');
 
-      const res = await this._apiRequest({
+      const res = await this.axiosInstance({
         method: 'POST',
         url: `${this.baseURL}/api/v1/auth/anonymous`,
         data: {
-          accessToken: env.GHOSTFOLIO_TOKEN,
+          accessToken: this.securityToken,
         },
       });
 
-      // Validate response structure
-      validateApiResponse(res.data, ['authToken']);
+      // Read through optional chaining: a null or non-object body would otherwise
+      // throw a TypeError from here and mask what the server actually returned.
+      const authToken = res.data?.authToken;
 
-      if (
-        !res.data.authToken ||
-        typeof res.data.authToken !== 'string' ||
-        res.data.authToken.length === 0
-      ) {
+      if (typeof authToken !== 'string' || authToken.length === 0) {
         AuditLogger.logAuth(false, { service: 'ghostfolio', reason: 'invalid_token' });
         throw new Error('Invalid authentication response: missing or empty authToken');
       }
 
-      this.accessToken = res.data.authToken;
+      this.accessToken = authToken;
       logger.info('Successfully authenticated with Ghostfolio');
       AuditLogger.logAuth(true, { service: 'ghostfolio' });
     } catch (error) {
@@ -200,7 +167,7 @@ class GhostfolioAPI {
     try {
       logger.debug('Fetching Ghostfolio accounts...');
 
-      const response = await this._apiRequest({
+      const response = await this.axiosInstance({
         method: 'GET',
         url: `${this.baseURL}/api/v1/account`,
         headers: {
@@ -208,15 +175,17 @@ class GhostfolioAPI {
         },
       });
 
-      // Validate response structure
-      validateApiResponse(response.data, ['accounts']);
+      // Optional chaining for the same reason as in authenticate(): this one check
+      // rejects a null body, a non-object body, a missing `accounts` and an
+      // `accounts` that is not an array.
+      const accounts = response.data?.accounts;
 
-      if (!Array.isArray(response.data.accounts)) {
+      if (!Array.isArray(accounts)) {
         throw new Error('Invalid API response: accounts must be an array');
       }
 
-      logger.info(`Found ${response.data.accounts.length} Ghostfolio accounts`);
-      return response.data.accounts;
+      logger.info(`Found ${accounts.length} Ghostfolio accounts`);
+      return accounts;
     } catch (error) {
       logger.error('Failed to fetch Ghostfolio accounts', sanitizeError(error));
       throw error;
@@ -264,7 +233,7 @@ class GhostfolioAPI {
         platformId: ghostfolioAccount.platformId ?? null,
       };
 
-      const response = await this._apiRequest({
+      const response = await this.axiosInstance({
         method: 'PUT',
         url: `${this.baseURL}/api/v1/account/${ghostfolioAccount.id}`,
         data: updateData,

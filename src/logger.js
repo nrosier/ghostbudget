@@ -1,11 +1,14 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const winston = require('winston');
-const { v4: uuidv4 } = require('uuid');
 const constants = require('./config/constants');
 
-// Generate correlation ID for this process instance
-const correlationId = uuidv4();
+// Correlation ID for this process instance. Node's own randomUUID rather than the
+// `uuid` package: it is the same v4 UUID from the same CSPRNG, with one fewer
+// dependency to install, audit and mock around in Jest — `uuid` ships as ESM and
+// needed a transformIgnorePatterns entry and a global mock to work here at all.
+const correlationId = crypto.randomUUID();
 
 // Create a null transport that does nothing
 const nullTransport = new winston.transports.Console({

@@ -10,7 +10,6 @@ const {
   validateFactor,
   validateAccountName,
   validateDataDir,
-  validateApiResponse,
   errorMessageOf,
   redactSecrets,
   sanitizeError,
@@ -188,7 +187,6 @@ describe('validateEnvironment', () => {
     const value = validateEnvironment(validEnv());
 
     expect(value.LOG_LEVEL).toBe('info');
-    expect(value.BATCH_SIZE).toBe(10);
     expect(value.MAX_RETRIES).toBe(3);
   });
 
@@ -463,26 +461,6 @@ describe('sanitizeError', () => {
   });
 });
 
-describe('validateApiResponse', () => {
-  it('returns the response when every required field is present', () => {
-    const response = { accounts: [], meta: null };
-
-    expect(validateApiResponse(response, ['accounts'])).toBe(response);
-  });
-
-  it('accepts a required field whose value is null or false', () => {
-    // The check is presence, not truthiness: `comment: null` is a real value.
-    expect(() => validateApiResponse({ comment: null }, ['comment'])).not.toThrow();
-    expect(() => validateApiResponse({ ok: false }, ['ok'])).not.toThrow();
-  });
-
-  it('rejects a missing field', () => {
-    expect(() => validateApiResponse({}, ['authToken'])).toThrow(/missing required field/);
-  });
-
-  it('rejects a response that is not an object', () => {
-    for (const value of [null, undefined, 'accounts', 42]) {
-      expect(() => validateApiResponse(value, [])).toThrow(/must be an object/);
-    }
-  });
-});
+// validateApiResponse is gone; the response shape checks it fronted now live at
+// their point of use in ghostfolio.js, where they are stricter than a presence
+// test. tests/ghostfolio.test.js covers them against real response bodies.

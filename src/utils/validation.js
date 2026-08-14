@@ -69,10 +69,11 @@ const envSchema = Joi.object({
   GHOSTFOLIO_TOKEN: Joi.string().min(constants.MIN_TOKEN_LENGTH).required(),
   LOG_LEVEL: Joi.string().valid('error', 'warn', 'info', 'debug').default('info'),
   NODE_ENV: Joi.string().valid('development', 'production', 'test').default('production'),
-  // CACHE_TTL_MINUTES is gone: the cache it configured never served a read in a
-  // one-shot process. Unknown variables are allowed, so an operator who still has
-  // it set in a .env file sees no error — it simply does nothing, as before.
-  BATCH_SIZE: Joi.number().integer().min(1).max(50).default(10),
+  // CACHE_TTL_MINUTES and BATCH_SIZE are both gone, for the same reason: each
+  // configured something that could not take effect in a one-shot process — a
+  // cache that never served a read, and batches over a synchronous local database.
+  // Unknown variables are allowed, so an operator who still has either set in a
+  // .env file sees no error; it simply does nothing, as before.
   MAX_RETRIES: Joi.number().integer().min(0).max(10).default(3),
 }).unknown(true); // Allow other env vars
 
@@ -402,26 +403,12 @@ function sanitizeError(error) {
   };
 }
 
-/**
- * Validate API response structure
- * @param {*} response - API response to validate
- * @param {Array<string>} requiredFields - Required fields in response
- * @returns {Object} Validated response
- * @throws {Error} If validation fails
- */
-function validateApiResponse(response, requiredFields = []) {
-  if (!response || typeof response !== 'object') {
-    throw new Error('Invalid API response: must be an object');
-  }
-
-  for (const field of requiredFields) {
-    if (!(field in response)) {
-      throw new Error(`Invalid API response: missing required field '${field}'`);
-    }
-  }
-
-  return response;
-}
+// There was a generic validateApiResponse(response, requiredFields) here. Both of
+// its call sites in ghostfolio.js followed it immediately with a stricter check of
+// the same field — `in` is satisfied by a present-but-null `authToken`, and by an
+// `accounts` that is a string — so the specific check was doing the work and the
+// generic one only decided which of two error messages came out. The checks that
+// remain are at their point of use in ghostfolio.js.
 
 module.exports = {
   validateConfig,
@@ -433,5 +420,4 @@ module.exports = {
   errorMessageOf,
   redactSecrets,
   sanitizeError,
-  validateApiResponse,
 };

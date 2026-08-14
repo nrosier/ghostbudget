@@ -9,11 +9,6 @@ jest.mock('../src/logger', () => ({
   debug: jest.fn(),
 }));
 
-// A plain function rather than jest.fn(): clearMocks resets implementations before
-// every test, which would make the shared uuid mock return undefined and hide
-// whether an event carries an id at all.
-jest.mock('uuid', () => ({ v4: () => 'test-uuid-1234' }));
-
 const logger = require('../src/logger');
 const AuditLogger = require('../src/utils/audit');
 
@@ -34,8 +29,17 @@ describe('AuditLogger.logAuth', () => {
 
     const payload = payloadOf(logger.info);
     expect(payload).toMatchObject({ event: 'auth', success: true, service: 'ghostfolio' });
-    expect(payload.event_id).toBeTruthy();
-    expect(payload.timestamp).toBeTruthy();
+  });
+
+  it('leaves timestamping and correlation to the logger', () => {
+    // Both used to be set here: a second ISO timestamp beside the one winston's
+    // format.timestamp() already adds, and an event_id UUID beside the per-process
+    // correlationId. Two fields that had to agree, and an id nothing read.
+    AuditLogger.logAuth(true, { service: 'ghostfolio' });
+
+    const payload = payloadOf(logger.info);
+    expect(payload.timestamp).toBeUndefined();
+    expect(payload.event_id).toBeUndefined();
   });
 
   it('records a failure as success: false rather than omitting it', () => {
@@ -116,12 +120,12 @@ describe('AuditLogger.logSecurityEvent', () => {
   it('routes critical and high severities to error level', () => {
     for (const severity of ['critical', 'high']) {
       jest.clearAllMocks();
-      AuditLogger.logSecurityEvent('circuit_breaker_open', severity, { service: 'ghostfolio' });
+      AuditLogger.logSecurityEvent('xss_attempt', severity, { input: 'account_name' });
 
       expect(logger.warn).not.toHaveBeenCalled();
       expect(payloadOf(logger.error)).toMatchObject({
         event: 'security',
-        event_type: 'circuit_breaker_open',
+        event_type: 'xss_attempt',
         severity,
       });
     }
@@ -130,7 +134,7 @@ describe('AuditLogger.logSecurityEvent', () => {
   it('routes lower severities to warn level', () => {
     for (const severity of ['medium', 'low']) {
       jest.clearAllMocks();
-      AuditLogger.logSecurityEvent('xss_attempt', severity, { input: 'account_name' });
+      AuditLogger.logSecurityEvent('protected_path', severity, { input: 'account_name' });
 
       expect(logger.error).not.toHaveBeenCalled();
       expect(payloadOf(logger.warn)).toMatchObject({ severity, input: 'account_name' });

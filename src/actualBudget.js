@@ -5,7 +5,6 @@ require('./config/tls');
 const api = require('@actual-app/api');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
-const constants = require('./config/constants');
 const {
   validateEnvironment,
   validateBalance,
@@ -45,33 +44,21 @@ async function getAccountBalances() {
 
     logger.info(`Found ${accounts.length} accounts`);
 
-    // Get balances for all accounts with validation
-    // Process in batches to prevent memory issues with large account lists
+    // Get balances for all accounts with validation.
+    //
+    // This used to run in BATCH_SIZE-sized slices, described as preventing memory
+    // issues with large account lists. It did neither thing: @actual-app/api reads
+    // balances out of a local better-sqlite3 database, whose calls are synchronous,
+    // so Promise.all never overlapped any work and the slices never bounded
+    // anything — every balance ended up in the same array either way. What was
+    // left was a loop, an environment variable, and a log line per batch.
     logger.debug('Fetching account balances...');
-    const balances = [];
-    const batchSize = env.BATCH_SIZE || constants.BATCH_SIZE;
-
-    for (let i = 0; i < accounts.length; i += batchSize) {
-      const batch = accounts.slice(i, i + batchSize);
-      logger.debug(
-        `Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(accounts.length / batchSize)}`
-      );
-
-      const batchBalances = await Promise.all(
-        batch.map(async (account) => {
-          const accountName = validateAccountName(account.name);
-          const balance = await api.getAccountBalance(account.id);
-          const validatedBalance = validateBalance(balance);
-
-          return {
-            name: accountName,
-            balance: validatedBalance,
-          };
-        })
-      );
-
-      balances.push(...batchBalances);
-    }
+    const balances = await Promise.all(
+      accounts.map(async (account) => ({
+        name: validateAccountName(account.name),
+        balance: validateBalance(await api.getAccountBalance(account.id)),
+      }))
+    );
 
     // Account names are logged; balance values are not, in any environment.
     // This used to be gated on NODE_ENV !== 'production', which meant every

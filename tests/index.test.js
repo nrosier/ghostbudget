@@ -51,7 +51,10 @@ describe('sync', () => {
     await expect(sync()).resolves.toBe(true);
 
     expect(ghostfolio.syncAccountBalances).toHaveBeenCalledWith(balances);
-    expect(AuditLogger.logSync).toHaveBeenCalledWith('started', expect.any(Object));
+    // No details on 'started': it used to carry a timestamp, which winston's own
+    // format.timestamp() already puts on every record. The event is the whole
+    // signal, and the correlation ID ties it to the rest of the run.
+    expect(AuditLogger.logSync).toHaveBeenCalledWith('started');
     expect(syncEvent('completed')).toMatchObject({ accounts_synced: 2 });
     expect(syncEvent('completed').duration_ms).toBeGreaterThanOrEqual(0);
   });
@@ -217,7 +220,6 @@ describe('process handlers', () => {
     await loaded.handlerFor(signal)(signal);
 
     expect(loaded.logger.info).toHaveBeenCalledWith(expect.stringContaining(`Received ${signal}`));
-    expect(loaded.logger.info).toHaveBeenCalledWith('Cleanup completed');
     expect(loaded.exit).toHaveBeenCalledWith(0);
   });
 

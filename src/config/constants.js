@@ -16,28 +16,6 @@ const MAX_RETRIES = 3; // Maximum retry attempts
 // request chain impossible to bound.
 const MAX_RETRY_DELAY_MS = 8000;
 
-// Headroom on top of the retry budget for rate-limiter queueing and scheduling.
-const CIRCUIT_BREAKER_TIMEOUT_MARGIN_MS = 5000;
-
-/**
- * Worst-case wall time for one fully-retried request chain, plus headroom.
- *
- * The circuit breaker wraps the whole axios-retry chain, so its timeout must
- * exceed that chain's worst case. If it does not, the breaker fires on requests
- * that are merely retrying: it records a failure, and — because opossum does not
- * cancel the action it wrapped — the in-flight request continues and can still
- * succeed, leaving the audit trail contradicting what actually happened.
- *
- * @param {number} maxRetries - Retries configured on the axios instance
- * @returns {number} Timeout in milliseconds
- */
-function circuitBreakerTimeoutFor(maxRetries = MAX_RETRIES) {
-  const attempts = maxRetries + 1;
-  return (
-    attempts * HTTP_TIMEOUT_MS + maxRetries * MAX_RETRY_DELAY_MS + CIRCUIT_BREAKER_TIMEOUT_MARGIN_MS
-  );
-}
-
 /**
  * Directory for Winston's file transports.
  *
@@ -83,15 +61,19 @@ module.exports = {
   // the log and widens the window for something sensitive to slip through.
   MAX_ERROR_MESSAGE_LENGTH: 512,
 
-  // Performance Configuration
-  BATCH_SIZE: 10, // Process accounts in batches of 10
+  // Retry Configuration
   MAX_RETRIES,
   MAX_RETRY_DELAY_MS,
 
   // Scheduler Configuration
-  // A sync that has not finished in 15 minutes is wedged: the whole request
-  // budget for one account is bounded by circuitBreakerTimeoutFor() above, so
-  // even a fully-retrying sync of 50 accounts finishes well inside this.
+  //
+  // This is the only wall-clock bound on a run, and it is a hard one: the
+  // scheduler sends SIGTERM at this point and escalates to SIGKILL. Per-request
+  // limits cannot substitute for it, because they bound one request chain
+  // (HTTP_TIMEOUT_MS × (MAX_RETRIES + 1) plus backoff, so about 144 s) and a sync
+  // makes one such chain per account — enough accounts retrying to exhaustion
+  // would run for hours. Fifteen minutes is well past a healthy sync of any
+  // realistic account list and well short of a run worth leaving alive.
   SYNC_TIMEOUT_MS: 15 * 60 * 1000,
   SYNC_SIGKILL_GRACE_MS: 10 * 1000, // Grace between SIGTERM and SIGKILL
   HEARTBEAT_INTERVAL_MS: 30 * 1000,
@@ -102,17 +84,6 @@ module.exports = {
   // to stop, and the scheduler still exits on its own terms, before SIGKILL.
   SHUTDOWN_GRACE_MS: 8 * 1000,
   healthStateFile,
-
-  // Rate Limiting Configuration
-  RATE_LIMIT_POINTS: 10, // 10 requests
-  RATE_LIMIT_DURATION: 1, // per 1 second
-  RATE_LIMIT_MAX_QUEUE: 100, // Requests may wait for a slot rather than failing
-
-  // Circuit Breaker Configuration
-  CIRCUIT_BREAKER_TIMEOUT_MARGIN_MS,
-  circuitBreakerTimeoutFor,
-  CIRCUIT_BREAKER_ERROR_THRESHOLD: 50, // 50% error rate
-  CIRCUIT_BREAKER_RESET_TIMEOUT: 30000, // 30 seconds
 
   // TLS Configuration
   //

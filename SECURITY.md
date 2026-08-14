@@ -16,11 +16,13 @@ inbound network surface, and no user-facing HTTP endpoint — its only external
 interactions are authenticated outbound calls to the two configured APIs.
 
 This report documents the security posture of the current codebase. All
-critical and high-severity findings from earlier audits have been resolved, and
-the controls that were previously listed as "planned" (rate limiting, circuit
-breaker, audit logging, correlation IDs) are now implemented and verified in
-code. The application is considered **production-ready** from a security
-standpoint.
+critical and high-severity findings from earlier audits have been resolved.
+Audit logging and correlation IDs are implemented and verified in code. Rate
+limiting and the circuit breaker were implemented and have since been **removed**
+on the evidence that neither could function in a one-shot sequential process and
+the breaker actively suppressed balance updates — see "Resilience & abuse
+protection" below. The application is considered **production-ready** from a
+security standpoint.
 
 | Risk area            | Status |
 | -------------------- | ------ |
@@ -75,9 +77,13 @@ repository to stay informed.
   ([src/config/constants.js:137-138](src/config/constants.js#L137-L138)). The
   Ghostfolio token is a UUID in practice, so 16 is a floor that catches
   truncation and copy-paste errors rather than a policy for humans to satisfy.
-- Balance, factor, account-name, and API-response validation
-  (`validateBalance`, `validateFactor`, `validateAccountName`,
-  `validateApiResponse`). `validateFactor` is separate from `validateBalance` on
+- Balance, factor, and account-name validation (`validateBalance`,
+  `validateFactor`, `validateAccountName`), plus response-shape checks at their
+  point of use in `ghostfolio.js`. A generic `validateApiResponse(body, fields)`
+  used to front those checks, but `field in body` is satisfied by a present-but-null
+  `authToken` and by an `accounts` that is a string, so the specific check that
+  always followed it was doing the work. `validateFactor` is separate from
+  `validateBalance` on
   purpose: a factor of `0` is falsy and finite, so a single "is this a usable
   number" check accepted it and silently zeroed every balance it touched.
 - Money is converted in minor units — `Math.round(cents * factor) / 100` — so a
@@ -118,9 +124,14 @@ repository to stay informed.
 ### Audit trail ✅
 
 - [src/utils/audit.js](src/utils/audit.js) records authentication attempts,
-  balance updates, sync start/complete/fail, security events (e.g.
-  circuit-breaker open, XSS attempt), and validation failures — each stamped
-  with a unique `event_id` and ISO timestamp.
+  balance updates, sync start/complete/fail/skipped, security events (e.g. a
+  rejected account name, a protected data directory), and validation failures.
+  Every record carries winston's ISO timestamp and the per-process
+  `correlationId`, which is what ties the events of one run together. Each payload
+  used to carry a second ISO timestamp and its own `event_id` UUID as well; the
+  timestamp duplicated winston's and nothing ever read the id, so both are gone —
+  and the `uuid` dependency with them, since `crypto.randomUUID()` produces the
+  correlation ID.
 - Balance-update events record **whether the balance actually changed**, compared
   against the value Ghostfolio already held. This was a hardcoded `true` for every
   account on every run, which made the audit trail useless for the one question it
@@ -147,15 +158,25 @@ repository to stay informed.
 
 ### Resilience & abuse protection ✅
 
-- **Rate limiting:** `rate-limiter-flexible` throttles outbound calls to 10
-  req/s ([src/ghostfolio.js](src/ghostfolio.js)).
-- **Circuit breaker:** `opossum` opens at a 50% error rate and logs a
-  high-severity audit event on open ([src/ghostfolio.js](src/ghostfolio.js)). Its
-  timeout is derived from the retry budget rather than fixed, so the breaker cannot
-  trip on a request that is still legitimately retrying underneath it.
 - **Retry with exponential backoff:** `axios-retry` retries network/idempotent
   errors and HTTP 429 up to `MAX_RETRIES` (default 3), with each delay capped at
-  `MAX_RETRY_DELAY_MS` ([src/ghostfolio.js](src/ghostfolio.js)).
+  `MAX_RETRY_DELAY_MS` ([src/ghostfolio.js](src/ghostfolio.js)). This is the only
+  resilience layer wrapped around the HTTP client, deliberately.
+- **One request in flight at a time.** A sync `await`s each account in turn, so
+  outbound concurrency is one, and a run makes roughly `2 + N` requests for `N`
+  mapped accounts. There was a `rate-limiter-flexible` queue in front of this
+  allowing 10 req/s; sequential execution is a tighter bound than the limit it
+  enforced, so the queue never queued a request and has been removed.
+- **No circuit breaker.** There was an `opossum` breaker here, opening at a 50%
+  error rate over the shared request stream, and it cost more than it bought. On a
+  run where authentication and the account fetch succeed and then some account
+  `PUT`s fail — a couple of stale mappings — the third failure opened it, and every
+  remaining account was then rejected locally without being sent, with its real
+  Ghostfolio error replaced by "Breaker is open" in both the thrown summary and the
+  audit trail. A few bad mappings became a wall in front of the accounts behind
+  them. Its 30 s `resetTimeout` could not recover inside a one-shot sync either.
+  The wall-clock backstop is the scheduler's `SYNC_TIMEOUT_MS`, which bounds the
+  whole run and escalates SIGTERM to SIGKILL — a bound the breaker never provided.
 - **Account updates are a bounded projection.** The update payload is built from
   the fields Ghostfolio's `UpdateAccountDto` accepts, not by spreading the fetched
   account. Ghostfolio's validation pipe runs with `forbidNonWhitelisted: true`, so a
@@ -256,7 +277,7 @@ push: false`, scans the loaded image, and only then logs in to the registry and
 | A01 Broken Access Control                    | ✅ PASS    | Minimal access model; no multi-user surface.                                                                         |
 | A02 Cryptographic Failures                   | ✅ PASS    | Secrets kept out of disk/logs; HTTPS + cert validation enforced.                                                     |
 | A03 Injection                                | ✅ PASS    | Joi validation on all inputs; cron expression validated.                                                             |
-| A04 Insecure Design                          | ✅ PASS    | Rate limiting, circuit breaker, and audit trail in place.                                                            |
+| A04 Insecure Design                          | ✅ PASS    | Sequential single-flight egress, bounded retries, hard sync timeout, and audit trail in place.                       |
 | A05 Security Misconfiguration                | ✅ PASS    | Secure defaults; non-root execution; HTTPS forced in production.                                                     |
 | A06 Vulnerable & Outdated Components         | ✅ PASS    | Dependencies current; `npm audit` reports 0 vulnerabilities; blocking high-severity gate in CI.                      |
 | A07 Identification & Authentication Failures | 🟡 PARTIAL | Token auth with audit logging and length minimums; no token expiry/refresh (see below).                              |
@@ -273,17 +294,26 @@ push: false`, scans the loaded image, and only then logs in to the registry and
 `npm audit` reports **0 known vulnerabilities**. Production dependencies are
 kept current (managed via Dependabot):
 
-| Package                 | Version |
-| ----------------------- | ------- |
-| `@actual-app/api`       | ^26.7.0 |
-| `axios`                 | 1.19.0  |
-| `axios-retry`           | ^4.5.0  |
-| `dotenv`                | 17.4.2  |
-| `joi`                   | 18.2.3  |
-| `opossum`               | ^10.0.0 |
-| `rate-limiter-flexible` | ^11.2.0 |
-| `uuid`                  | ^14.0.1 |
-| `winston`               | 3.19.0  |
+| Package           | Version |
+| ----------------- | ------- |
+| `@actual-app/api` | ^26.8.1 |
+| `axios`           | 1.19.0  |
+| `axios-retry`     | ^4.5.0  |
+| `croner`          | 10.0.1  |
+| `dotenv`          | 17.4.2  |
+| `joi`             | 18.2.3  |
+| `winston`         | 3.19.0  |
+
+`opossum`, `rate-limiter-flexible` and `uuid` were direct production dependencies
+and no longer are — the first two because the controls they provided could not
+function here (see "Resilience & abuse protection"), and `uuid` because
+`crypto.randomUUID()` is in the standard library.
+
+`opossum` and `rate-limiter-flexible` are gone from `package-lock.json` outright,
+so their code is no longer installed or scanned. `uuid` is a different case and
+worth stating precisely: `@actual-app/api` depends on it, so it remains in the tree
+transitively and still appears to a scanner. Dropping it removed a version this
+project pinned and had to mock around in Jest, not a package from the image.
 
 ---
 
