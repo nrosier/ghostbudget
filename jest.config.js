@@ -22,13 +22,13 @@ module.exports = {
   // src/healthcheck.js, src/index.js, src/scheduler.js and src/utils/exit.js.
   coverageThreshold: {
     global: {
-      statements: 96,
+      statements: 97,
       branches: 92,
       // 91.89 is the ceiling, not a gap to close: the shortfall is index.js's
       // `require.main === module` block, whose two callbacks cannot run in a module
       // a test has required. Reaching them means spawning a subprocess.
       functions: 91,
-      lines: 96,
+      lines: 97,
     },
     './src/utils/validation.js': {
       statements: 100,
@@ -50,14 +50,13 @@ module.exports = {
       functions: 100,
       lines: 100,
     },
-    // The remaining gaps here are axios-retry's `retryDelay` and `onRetry`
-    // callbacks, which need a real clock to reach — which is also why `functions`
-    // sits well below the others. Raise these to whatever the suite achieves.
+    // Fully covered apart from one branch: axios-retry's `retryDelay` callback,
+    // which needs a real clock to reach.
     './src/ghostfolio.js': {
-      statements: 98,
-      branches: 97,
-      functions: 87,
-      lines: 98,
+      statements: 100,
+      branches: 98,
+      functions: 100,
+      lines: 100,
     },
     './src/config/': {
       statements: 100,

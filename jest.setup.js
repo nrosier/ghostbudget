@@ -1,3 +1,13 @@
+const nock = require('nock');
+
+// No test may open a socket. The suites point at http://localhost:3333, which is
+// Ghostfolio's own default port, so a test missing an interceptor did not fail —
+// it sent a real balance PUT to whatever was listening on the developer's machine.
+// This also makes every "no request was sent" assertion load-bearing: without it,
+// a scope's `isDone() === false` only proves nock did not serve the request, not
+// that nothing was sent.
+nock.disableNetConnect();
+
 // Mock browser globals for @actual-app/api
 global.navigator = {
   userAgent: 'node.js',

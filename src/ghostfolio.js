@@ -55,6 +55,26 @@ function exactlyOneNamed(accounts, name, side) {
 }
 
 /**
+ * Convert an Actual Budget balance to the value Ghostfolio stores.
+ *
+ * Rounding happens in minor units, before dividing. Actual Budget stores balances as
+ * integer cents, but a factor need not be an integer, and float arithmetic on the way
+ * out produced values like 1100.1320000000001 from 100012 * 1.1 / 100 — sent verbatim
+ * to a financial API and stored as the account's balance.
+ *
+ * Shared rather than inlined because two places need the same number: the write, and
+ * the read-back that confirms it. Two copies of this expression could drift by a cent
+ * and turn every confirmed write into a reported mismatch.
+ *
+ * @param {number} balanceInMinorUnits - Validated Actual Budget balance
+ * @param {number} factor - Validated positive multiplier
+ * @returns {number} Balance in major units, as Ghostfolio stores it
+ */
+function toStoredBalance(balanceInMinorUnits, factor) {
+  return Math.round(balanceInMinorUnits * factor) / 100;
+}
+
+/**
  * The fields Ghostfolio's `UpdateAccountDto` accepts, besides `balance`.
  *
  * The account PUT used to hand-build its payload from seven fixed fields, which
@@ -231,46 +251,97 @@ class GhostfolioAPI {
   }
 
   /**
-   * Confirm that Ghostfolio stored the balance that was sent.
+   * Confirm that Ghostfolio stored the balance that was sent, by reading it back.
    *
-   * A 2xx used to be the whole of the success criterion, and it is not the same
-   * claim: the update response carries the account as it now stands, so the value
-   * actually stored is right there and was being discarded. Comparing it turns
-   * "the server accepted the request" into "the balance in Ghostfolio is the
-   * balance from Actual Budget", which is the only thing this tool exists to
-   * assert.
+   * A 2xx is not the claim this tool needs to make. The claim is "the balance in
+   * Ghostfolio is the balance from Actual Budget", and the only way to establish it
+   * is to ask Ghostfolio what it now holds.
    *
-   * No balance appears in the message or the log line, here or anywhere else. The
+   * This used to compare against the balance in the update response, which cannot
+   * work: `PUT /api/v1/account/:id` returns a Prisma `Account`, and that model has
+   * no `balance` column at all — balances live in `AccountBalance` rows keyed by
+   * (accountId, date), which `updateAccount` writes separately under today's date.
+   * So the response never carried a balance, the comparison never ran, and every
+   * write logged "could not confirm" instead. A check that cannot fire is worse than
+   * no check, because the log says something was verified.
+   *
+   * The account list, by contrast, does carry `balance`: Ghostfolio derives it as
+   * the most recent non-future `AccountBalance` value, which after a write today is
+   * the value written. One extra GET per run confirms every write in it.
+   *
+   * No balance appears in any message or log line, here or anywhere else. The
    * operator can read both values in Ghostfolio's own UI; a log file on a mounted
    * volume is not the place for them.
    *
-   * @param {string} accountName - Account name, for the message
-   * @param {number} sentBalance - Balance sent in the update, in major units
-   * @param {*} responseData - Body of the update response
-   * @throws {Error} If the stored balance differs from the one sent
+   * @param {Array<{ghostfolioAccount: Object, sentBalance: number}>} writes - Completed writes
+   * @returns {Promise<{confirmed: number, errors: Array<string>}>} Confirmation outcome
    */
-  verifyStoredBalance(accountName, sentBalance, responseData) {
-    const stored = responseData?.balance;
+  async confirmStoredBalances(writes) {
+    let storedAccounts;
 
-    if (typeof stored !== 'number' || !Number.isFinite(stored)) {
-      // Not an error: a Ghostfolio version that answers with an empty body, or a
-      // proxy that strips it, has not told us the write went wrong either. Say
-      // plainly that it is unconfirmed rather than implying it was checked.
+    try {
+      storedAccounts = await this.getGhostfolioAccounts();
+    } catch (error) {
+      // The writes were acknowledged; it is the confirmation that could not be made.
+      // Failing the run here would report a failure for a sync that most likely
+      // worked, so this is reported as unconfirmed instead — visible as
+      // `confirmed < written` in the summary rather than buried in a log line.
       logger.warn(
-        `Could not confirm the stored balance for account ${accountName}: ` +
-          'the update response carried no balance field',
-        { account: accountName }
+        'Could not read balances back to confirm them; the writes were acknowledged but ' +
+          'are unconfirmed',
+        sanitizeError(error)
       );
-      return;
+      return { confirmed: 0, errors: [] };
     }
 
-    if (Math.abs(stored - sentBalance) >= constants.BALANCE_EPSILON) {
-      throw new Error(
-        `Ghostfolio stored a different balance than was sent for account ${accountName}`
-      );
+    const errors = [];
+    let confirmed = 0;
+
+    for (const { ghostfolioAccount, sentBalance } of writes) {
+      const stored = storedAccounts.find((account) => account.id === ghostfolioAccount.id);
+      const storedBalance = Number(stored?.balance);
+
+      if (!stored || !Number.isFinite(storedBalance)) {
+        logger.warn(
+          `Could not confirm the stored balance for account ${ghostfolioAccount.name}: ` +
+            'it is absent from the account list read back',
+          { account: ghostfolioAccount.name }
+        );
+        continue;
+      }
+
+      if (Math.abs(storedBalance - sentBalance) >= constants.BALANCE_EPSILON) {
+        errors.push(
+          `Ghostfolio stored a different balance than was sent for account ` +
+            `${ghostfolioAccount.name}`
+        );
+        continue;
+      }
+
+      confirmed += 1;
     }
+
+    return { confirmed, errors };
   }
 
+  /**
+   * Bring one Ghostfolio account's balance in line with Actual Budget's.
+   *
+   * Returns which of the three things happened, because the caller has to be able
+   * to report it and cannot work it out for itself: `'written'` (the request was
+   * accepted), `'unchanged'` (already correct, nothing sent) or `'dry_run'` (would
+   * have been written). This used to return the update response body, which no
+   * caller read and which carries nothing worth reading.
+   *
+   * `'written'` means accepted, not confirmed — confirming is confirmStoredBalances'
+   * job, once the writes are done.
+   *
+   * @param {Object} ghostfolioAccount - Account as Ghostfolio returned it
+   * @param {number} actualBudgetBalance - Balance in minor units
+   * @param {number} [factor] - Positive multiplier
+   * @returns {Promise<'written'|'unchanged'|'dry_run'>} What happened
+   * @throws {Error} If validation fails or the request fails
+   */
   async updateAccountBalance(ghostfolioAccount, actualBudgetBalance, factor = 1) {
     if (!this.accessToken) {
       throw new Error('Not authenticated. Call authenticate() first');
@@ -285,12 +356,7 @@ class GhostfolioAPI {
       const validatedBalance = validateBalance(actualBudgetBalance);
       const validatedFactor = validateFactor(factor);
 
-      // Round in minor units before dividing. Actual Budget stores balances as
-      // integer cents, but a factor need not be an integer, and float arithmetic
-      // on the way out produced values like 1100.1320000000001 from
-      // 100012 * 1.1 / 100 — sent verbatim to a financial API and stored as the
-      // account's balance.
-      const newBalance = Math.round(validatedBalance * validatedFactor) / 100;
+      const newBalance = toStoredBalance(validatedBalance, validatedFactor);
 
       // The previous balance decides whether this write happens at all. It is
       // compared, never logged. A previous balance that is absent or unreadable
@@ -312,7 +378,7 @@ class GhostfolioAPI {
           service: 'ghostfolio',
           written: false,
         });
-        return null;
+        return 'unchanged';
       }
 
       if (this.dryRun) {
@@ -322,7 +388,7 @@ class GhostfolioAPI {
           written: false,
           dry_run: true,
         });
-        return null;
+        return 'dry_run';
       }
 
       logger.debug('Updating account balance', {
@@ -342,7 +408,7 @@ class GhostfolioAPI {
         platformId: ghostfolioAccount.platformId ?? null,
       };
 
-      const response = await this.axiosInstance({
+      await this.axiosInstance({
         method: 'PUT',
         // encodeURIComponent on top of validateAccountId: the validator already
         // restricts the character set, and encoding costs nothing for an id that
@@ -355,15 +421,16 @@ class GhostfolioAPI {
         },
       });
 
-      this.verifyStoredBalance(accountName, newBalance, response.data);
-
+      // Nothing in the response is read. It carries a Prisma `Account`, which has no
+      // balance column; the balance is confirmed by reading the account list back
+      // once the writes are done. See confirmStoredBalances.
       logger.info(`Successfully updated balance for account ${accountName}`);
       AuditLogger.logBalanceUpdate(accountName, true, {
         service: 'ghostfolio',
         written: true,
       });
 
-      return response.data;
+      return 'written';
     } catch (error) {
       logger.error(
         `Failed to update balance for account ${ghostfolioAccount.name}`,
@@ -450,6 +517,25 @@ class GhostfolioAPI {
     };
   }
 
+  /**
+   * Sync every mapped account's balance, and report what happened.
+   *
+   * The summary is the point of the return value: the caller cannot derive it. It
+   * knows how many accounts Actual Budget has, which is neither the number mapped
+   * nor the number written, and the top-level audit record used to report that
+   * count as `accounts_synced` — 20 for a budget with 20 accounts and two mappings.
+   *
+   * `changed + unchanged === resolved`, and `written === changed` unless this is a
+   * dry run, where it is 0. `confirmed` is how many of those writes were read back
+   * and matched; it is below `written` only when the read-back could not be made. On
+   * failure the same object is attached to the thrown error as `.summary`, so a
+   * partial run can still record what it managed to write.
+   *
+   * @param {Array<{name: string, balance: number}>} actualBalances - Actual Budget accounts
+   * @returns {Promise<{mapped: number, resolved: number, changed: number, written: number,
+   *   confirmed: number, unchanged: number, failed: number, dry_run: boolean}>} What the run did
+   * @throws {Error} If any mapping failed, or if the all-zero gate refused the run
+   */
   async syncAccountBalances(actualBalances) {
     // Config first. It used to be read after authenticating, so a mistyped
     // config.json still exchanged the security token for an auth token and fetched
@@ -499,25 +585,80 @@ class GhostfolioAPI {
       );
     }
 
-    // Phase two: write.
+    // Phase two: write. Counted per outcome rather than by length, because the
+    // three of them are different claims and only one is "a balance was stored".
+    const writes = [];
+    let unchanged = 0;
+    let wouldWrite = 0;
     for (const target of targets) {
       try {
-        await this.updateAccountBalance(target.ghostfolioAccount, target.balance, target.factor);
+        const outcome = await this.updateAccountBalance(
+          target.ghostfolioAccount,
+          target.balance,
+          target.factor
+        );
+        if (outcome === 'written') {
+          writes.push({
+            ghostfolioAccount: target.ghostfolioAccount,
+            sentBalance: toStoredBalance(target.balance, target.factor),
+          });
+        } else if (outcome === 'unchanged') {
+          unchanged += 1;
+        } else {
+          wouldWrite += 1;
+        }
       } catch (error) {
         logger.error('Account sync failed', sanitizeError(error));
         errors.push(errorMessageOf(error));
       }
     }
 
+    // Phase three: read the balances back. A 2xx says the request was accepted, not
+    // that the value now in Ghostfolio is the value from Actual Budget — and that
+    // second claim is the only one this tool exists to make. One GET confirms every
+    // write in the run.
+    const written = writes.length;
+    let confirmed = 0;
+    if (written > 0) {
+      const confirmation = await this.confirmStoredBalances(writes);
+      confirmed = confirmation.confirmed;
+      errors.push(...confirmation.errors);
+      for (const message of confirmation.errors) {
+        logger.error('Stored balance did not match what was sent', { error: message });
+      }
+    }
+
+    const summary = {
+      mapped: config.accounts.length,
+      resolved: targets.length,
+      changed: written + wouldWrite,
+      written,
+      // Reported alongside `written` rather than folded into it: `confirmed < written`
+      // means the writes were acknowledged but could not be read back, which is a
+      // weaker claim than a confirmed sync and should not look like one.
+      confirmed,
+      unchanged,
+      failed: errors.length,
+      dry_run: this.dryRun,
+    };
+
     if (errors.length > 0) {
-      throw new Error(`Failed to sync ${errors.length} account(s): ${errors.join('; ')}`);
+      // Attached rather than only thrown: the run still wrote whatever it could,
+      // and "3 of 5 stored" is the fact an operator needs from a failed sync. The
+      // throw stays, so the exit code still reports failure.
+      const error = new Error(`Failed to sync ${errors.length} account(s): ${errors.join('; ')}`);
+      error.summary = summary;
+      throw error;
     }
 
     logger.info(
       this.dryRun
         ? 'DRY_RUN: every account mapping resolved and no balance was written'
-        : 'Successfully synced all account balances'
+        : 'Successfully synced all account balances',
+      summary
     );
+
+    return summary;
   }
 }
 

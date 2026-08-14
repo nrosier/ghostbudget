@@ -26,7 +26,8 @@ The script will:
 2. Read and validate `config.json`
 3. Authenticate with Ghostfolio and fetch the current account list
 4. Resolve every mapping to the write it describes, sending nothing
-5. Update the balances that need it, verifying each stored value
+5. Update the balances that need it
+6. Read the balances back and confirm each one is the value that was sent
 
 ## Installation
 
@@ -303,13 +304,19 @@ spans the whole mapped set can exist before the first write happens:
 - **A balance that has not moved is not rewritten.** Every write is an opportunity
   to store the wrong number, so an account whose Ghostfolio balance already matches
   is skipped. On a typical run this skips most of them.
-- **Every write is read back.** Ghostfolio's update response carries the account as
-  it now stands; if the stored balance is not the one that was sent, that account
-  fails rather than being reported as synced. An HTTP 2xx on its own is not the
-  same claim.
+- **Every write is read back.** Once the writes are done, the account list is
+  fetched again and each written balance compared with what was sent. If Ghostfolio
+  is not holding the value that was sent, that account fails rather than being
+  reported as synced — an HTTP 2xx says the request was accepted, which is not the
+  same claim. If the read-back itself cannot be made, the run reports
+  `confirmed` below `written` rather than either failing or claiming confirmation.
 - **One bad mapping does not cost the others their sync.** Each failure is
   recorded, the remaining accounts are still processed, and the run then exits
   non-zero with a summary naming how many failed.
+- **The run reports what it did, not what it saw.** The completed-sync audit record
+  carries `mapped`, `resolved`, `changed`, `written`, `confirmed`, `unchanged` and
+  `failed`, so "nothing needed writing tonight" and "two balances were stored" are
+  distinguishable after the fact. A partially failed run records the same counts.
 
 No balance value appears in any log line, error message, or audit record — not the
 value read, the value sent, or the value already stored. Error messages name the
@@ -375,9 +382,15 @@ Common issues and solutions:
      without applying its sync messages reports every account as empty.
 
 5. **`Ghostfolio stored a different balance than was sent`**
-   - The write completed but Ghostfolio's response reported a different value. Read
-     the account in Ghostfolio's UI before re-running; something between this tool
-     and the database changed the value.
+   - The write was accepted, but reading the account back afterwards returned a
+     different value. Read the account in Ghostfolio's UI before re-running;
+     something between this tool and the database changed the value.
+
+6. **`confirmed` is lower than `written` in the logs**
+   - Every write was accepted, but the balances could not all be read back — either
+     the confirming request failed, or an account was no longer in the list. The
+     values were most likely stored; they are simply unverified. If it persists, the
+     account list is the thing to look at.
 
 ## License
 

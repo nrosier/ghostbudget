@@ -40,13 +40,25 @@ describe('sync', () => {
     { name: 'Brokerage Account', balance: 100084 },
   ];
 
+  /** @returns {Object} A syncAccountBalances summary for a two-mapping run */
+  const summary = (overrides = {}) => ({
+    mapped: 2,
+    resolved: 2,
+    changed: 1,
+    written: 1,
+    unchanged: 1,
+    failed: 0,
+    dry_run: false,
+    ...overrides,
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
   it('fetches balances, forwards them, and audits a completed run', async () => {
     getAccountBalances.mockResolvedValue(balances);
-    ghostfolio.syncAccountBalances.mockResolvedValue(undefined);
+    ghostfolio.syncAccountBalances.mockResolvedValue(summary());
 
     await expect(sync()).resolves.toBe(true);
 
@@ -55,13 +67,68 @@ describe('sync', () => {
     // format.timestamp() already puts on every record. The event is the whole
     // signal, and the correlation ID ties it to the rest of the run.
     expect(AuditLogger.logSync).toHaveBeenCalledWith('started');
-    expect(syncEvent('completed')).toMatchObject({ accounts_synced: 2 });
+    expect(syncEvent('completed')).toMatchObject(summary());
     expect(syncEvent('completed').duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('audits how many accounts were written, not how many the budget has', async () => {
+    // Two accounts in Actual Budget, one mapping, and that one balance had not
+    // moved. `accounts_synced: balances.length` recorded a successful sync of 2.
+    getAccountBalances.mockResolvedValue(balances);
+    ghostfolio.syncAccountBalances.mockResolvedValue(
+      summary({ mapped: 1, resolved: 1, changed: 0, written: 0, unchanged: 1 })
+    );
+
+    await sync();
+
+    expect(syncEvent('completed')).toMatchObject({
+      accounts_in_budget: 2,
+      mapped: 1,
+      written: 0,
+      unchanged: 1,
+    });
+    expect(syncEvent('completed')).not.toHaveProperty('accounts_synced');
+  });
+
+  it('reports nothing written on a dry run', async () => {
+    getAccountBalances.mockResolvedValue(balances);
+    ghostfolio.syncAccountBalances.mockResolvedValue(
+      summary({ changed: 2, written: 0, unchanged: 0, dry_run: true })
+    );
+
+    await sync();
+
+    expect(syncEvent('completed')).toMatchObject({ written: 0, changed: 2, dry_run: true });
+  });
+
+  it('records what a partially failed run managed to write', async () => {
+    // The counts ride on the error, because a run that stored 1 of 2 balances has
+    // told the operator something a bare error message cannot.
+    const failure = new Error('Failed to sync 1 account(s): Currency mismatch');
+    failure.summary = summary({ changed: 1, written: 1, unchanged: 0, failed: 1 });
+    getAccountBalances.mockResolvedValue(balances);
+    ghostfolio.syncAccountBalances.mockRejectedValue(failure);
+
+    await expect(sync()).rejects.toThrow(/Failed to sync 1 account/);
+
+    expect(syncEvent('failed')).toMatchObject({ written: 1, failed: 1 });
+  });
+
+  it('audits a failure that never reached the write phase without inventing counts', async () => {
+    getAccountBalances.mockResolvedValue(balances);
+    ghostfolio.syncAccountBalances.mockRejectedValue(new Error('Config file not found'));
+
+    await expect(sync()).rejects.toThrow(/Config file not found/);
+
+    const event = syncEvent('failed');
+    expect(event).toMatchObject({ error_type: 'unknown_error' });
+    expect(event).not.toHaveProperty('written');
+    expect(event).not.toHaveProperty('mapped');
   });
 
   it('does not record account balances in the audit trail', async () => {
     getAccountBalances.mockResolvedValue(balances);
-    ghostfolio.syncAccountBalances.mockResolvedValue(undefined);
+    ghostfolio.syncAccountBalances.mockResolvedValue(summary());
 
     await sync();
 

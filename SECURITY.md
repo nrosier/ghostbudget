@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-08-14
 **Application Version:** 1.0.0
-**Audit Version:** 3.2
+**Audit Version:** 3.3
 **Overall Risk Level:** 🟢 **LOW**
 
 ---
@@ -28,10 +28,11 @@ The threat this tool has to answer for is not primarily disclosure — it holds 
 data of its own and has no inbound surface. It is **write integrity**: the one
 thing it does to Ghostfolio is overwrite account balances, so a failure that
 overwrites a correct balance with an incorrect one is more costly than a failure
-that writes nothing. Audit 3.2 is the pass that took that seriously — see
-"Write integrity" below. It assumes nothing about the two services being
-co-located or trusted, because a deployment that puts them on one Docker host is
-a convention, not a guarantee.
+that writes nothing. Audit 3.2 is the pass that took that seriously, and 3.3
+corrected the one control in it that could not fire — the read-back compared
+against a response field that does not exist — see "Write integrity" below. It
+assumes nothing about the two services being co-located or trusted, because a
+deployment that puts them on one Docker host is a convention, not a guarantee.
 
 | Risk area            | Status |
 | -------------------- | ------ |
@@ -162,6 +163,12 @@ repository to stay informed.
   sent** (`written`, plus `dry_run` under `DRY_RUN`). `changed` was a hardcoded
   `true` for every account on every run, which made the audit trail useless for the
   one question it exists to answer: what did this job change?
+- The completed-sync event records `mapped`, `resolved`, `changed`, `written`,
+  `confirmed`, `unchanged` and `failed`, taken from the sync itself. It used to
+  record `accounts_synced` as the length of the Actual Budget account list, so a
+  budget with 20 accounts and two mappings audited a successful sync of 20 — and a
+  dry run audited a successful sync of 20 while writing nothing. A partially failed
+  run carries the same counts, so "3 of 5 stored" survives the failure.
 
 ### Write integrity ✅
 
@@ -191,11 +198,23 @@ version.
   Ghostfolio account. A mismatch fails that account and the rest of the run
   continues. Previously a balance in one currency was written verbatim into an
   account denominated in another, with no error and no warning.
-- **Every write is read back.** Ghostfolio's update response carries the account as
-  stored; if the balance differs from the one sent (beyond `BALANCE_EPSILON`, half
-  a cent), that account fails. An HTTP 2xx alone is a weaker claim than "the
-  balance in Ghostfolio is the balance from Actual Budget". A response with no
-  balance field warns that the write is unconfirmed rather than failing it.
+- **Every write is read back.** After the writes, the account list is fetched a
+  second time and each written balance compared with the one sent; a difference
+  beyond `BALANCE_EPSILON` (half a cent) fails that account. An HTTP 2xx alone is a
+  weaker claim than "the balance in Ghostfolio is the balance from Actual Budget".
+  If the read-back cannot be made — the request fails, or an account is no longer in
+  the list — the run reports `confirmed` below `written` rather than failing writes
+  that were accepted or claiming a confirmation it does not have.
+
+  This check previously compared against the balance in the **update** response,
+  which cannot work and never did: `PUT /api/v1/account/:id` returns a Prisma
+  `Account`, and that model has no `balance` column — balances are `AccountBalance`
+  rows keyed by `(accountId, date)`, written separately. So the field was always
+  absent, the comparison never ran, and every write logged "unconfirmed". The
+  account list is the endpoint that carries `balance`, derived as the most recent
+  non-future `AccountBalance` value. A check that cannot fire is worse than no
+  check, because the log implies something was verified.
+
 - **Unchanged balances are not rewritten.** Every write is an opportunity to store
   a wrong number. The PUT used to fire regardless of whether the value had moved.
 - **One failure does not stop the rest.** Per-mapping errors are collected and the
@@ -485,7 +504,9 @@ rest are the operator's responsibility.
 - ✅ Plaintext HTTP is refused for both API endpoints unless the host is one only a
   local network can reach.
 - ✅ A run in which every mapped account reads zero writes nothing, and every write
-  is read back and compared against the value that was sent.
+  is read back — in a separate request, once the writes are done — and compared
+  against the value that was sent. `confirmed` below `written` in the logs means
+  those balances were accepted but not verified; it is worth a look, not an alarm.
 - [ ] Secrets are stored in a secret manager, not committed `.env` files.
 - [ ] `ACTUAL_BUDGET_PASS` and `GHOSTFOLIO_TOKEN` are real credentials, not
       placeholders — the 8- and 16-character minimums catch empty and truncated

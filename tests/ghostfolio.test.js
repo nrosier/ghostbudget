@@ -116,30 +116,99 @@ describe('ghostfolio', () => {
         .reply(200, { accounts });
     }
 
+    // What the update stubs were told to expect, so the read-back can report the
+    // same values without every test restating them.
+    let sentBalances;
+
+    beforeEach(() => {
+      sentBalances = new Map();
+    });
+
     /**
-     * Stub a balance update that echoes back what it was sent, as Ghostfolio does.
+     * Stub a balance update.
+     *
+     * The reply body is a bare Prisma `Account`, which is what Ghostfolio returns and
+     * which carries no balance — the balance lives in AccountBalance rows. Nothing in
+     * it is read.
      *
      * @param {string} id - Account id
      * @param {number} expectedBalance - Balance the request must carry
      */
     function stubUpdate(id, expectedBalance) {
+      sentBalances.set(id, expectedBalance);
       nock(baseUrl)
         .put(`/api/v1/account/${id}`, (body) => {
           expect(body.balance).toBe(expectedBalance);
           return true;
         })
         .matchHeader('Authorization', `Bearer ${authToken}`)
-        .reply(200, (uri, body) => ({ id, balance: body.balance }));
+        .reply(200, { id, name: 'Savings Account', currency: 'EUR' });
+    }
+
+    /**
+     * Stub the read-back that confirms the writes, reporting what was sent.
+     *
+     * Must be called after stubAuthAndAccounts: nock serves same-path interceptors in
+     * registration order, so this is the second GET of the run.
+     *
+     * @param {Array<Object>} [accounts] - Accounts the list endpoint reports
+     * @param {Map<string, number>} [overrides] - Balances to report instead of what was sent
+     */
+    function stubReadBack(accounts = ghostfolioAccounts, overrides = new Map()) {
+      nock(baseUrl)
+        .get('/api/v1/account')
+        .reply(200, {
+          accounts: accounts.map((account) => ({
+            ...account,
+            balance: overrides.has(account.id)
+              ? overrides.get(account.id)
+              : sentBalances.get(account.id),
+          })),
+        });
     }
 
     it('should sync balances successfully', async () => {
       stubAuthAndAccounts();
       stubUpdate('123', 1000.12);
       stubUpdate('321', 1000.84);
+      stubReadBack();
 
-      await ghostfolio.syncAccountBalances(actualBalances);
+      // The summary is the only account of what a run did: the caller knows how
+      // many accounts Actual Budget has, which is neither the number mapped nor
+      // the number written.
+      await expect(ghostfolio.syncAccountBalances(actualBalances)).resolves.toEqual({
+        mapped: 2,
+        resolved: 2,
+        changed: 2,
+        written: 2,
+        confirmed: 2,
+        unchanged: 0,
+        failed: 0,
+        dry_run: false,
+      });
 
       expect(nock.isDone()).toBe(true);
+    });
+
+    it('counts a balance that had not moved as unchanged, not as written', async () => {
+      // The nightly case: both Ghostfolio accounts already hold the incoming value,
+      // so a correct run writes nothing and must not report two accounts synced.
+      stubAuthAndAccounts([
+        { ...ghostfolioAccounts[0], balance: 1000.12 },
+        { ...ghostfolioAccounts[1], balance: 1000.84 },
+      ]);
+      const wouldBeWritten = nock(baseUrl)
+        .put(/\/api\/v1\/account\/\d+/)
+        .reply(200, {});
+
+      await expect(ghostfolio.syncAccountBalances(actualBalances)).resolves.toMatchObject({
+        resolved: 2,
+        changed: 0,
+        written: 0,
+        unchanged: 2,
+      });
+
+      expect(wouldBeWritten.isDone()).toBe(false);
     });
 
     it('should not fail completely when a single account cannot sync', async () => {
@@ -149,10 +218,15 @@ describe('ghostfolio', () => {
       // retry a 500 on an idempotent PUT.
       nock(baseUrl).put('/api/v1/account/123').reply(400, { success: false });
       stubUpdate('321', 1000.84);
+      stubReadBack();
 
-      await expect(ghostfolio.syncAccountBalances(actualBalances)).rejects.toThrow(
-        /Failed to sync 1 account\(s\)/
-      );
+      const error = await ghostfolio.syncAccountBalances(actualBalances).catch((e) => e);
+
+      expect(error.message).toMatch(/Failed to sync 1 account\(s\)/);
+      // The counts ride on the error too, so a partial run is auditable: one of the
+      // two balances is now stored and confirmed, and the exit code alone cannot say
+      // which.
+      expect(error.summary).toMatchObject({ resolved: 2, written: 1, confirmed: 1, failed: 1 });
 
       // The second account was still written: one bad mapping does not cost the
       // others their sync.
@@ -213,17 +287,25 @@ describe('ghostfolio', () => {
         { ghostfolioName: 'AT&T Stock', actualBudgetName: 'AT&T Stock' },
       ]);
 
+      const account = {
+        id: '999',
+        name: 'AT&T Stock',
+        currency: 'EUR',
+        comment: null,
+        platformId: null,
+      };
+
       try {
-        stubAuthAndAccounts([
-          { id: '999', name: 'AT&T Stock', currency: 'EUR', comment: null, platformId: null },
-        ]);
+        stubAuthAndAccounts([account]);
         nock(baseUrl)
           .put('/api/v1/account/999', (body) => {
             expect(body.name).toBe('AT&T Stock');
             expect(body.balance).toBe(1000.12);
             return true;
           })
-          .reply(200, { balance: 1000.12 });
+          .reply(200, {});
+        sentBalances.set('999', 1000.12);
+        stubReadBack([account]);
 
         await ghostfolio.syncAccountBalances([{ name: 'AT&T Stock', balance: 100012 }]);
 
@@ -261,6 +343,7 @@ describe('ghostfolio', () => {
       stubAuthAndAccounts();
       stubUpdate('123', 0);
       stubUpdate('321', 1000.84);
+      stubReadBack();
 
       await ghostfolio.syncAccountBalances([
         { name: 'Main Savings', balance: 0 },
@@ -329,6 +412,7 @@ describe('ghostfolio', () => {
         stubAuthAndAccounts();
         const mismatched = nock(baseUrl).put('/api/v1/account/123').reply(200, {});
         stubUpdate('321', 1000.84);
+        stubReadBack();
 
         await expect(ghostfolio.syncAccountBalances(actualBalances)).rejects.toThrow(
           /Currency mismatch for account Savings Account: config.json declares USD, the Ghostfolio account is denominated in EUR/
@@ -370,7 +454,15 @@ describe('ghostfolio', () => {
           .put(/\/api\/v1\/account\/\d+/)
           .reply(200, {});
 
-        await expect(dryRun.syncAccountBalances(actualBalances)).resolves.toBeUndefined();
+        // `changed` counts what would move; `written` is 0, so a dry run cannot be
+        // mistaken for a successful sync in the audit trail.
+        await expect(dryRun.syncAccountBalances(actualBalances)).resolves.toMatchObject({
+          resolved: 2,
+          changed: 2,
+          written: 0,
+          failed: 0,
+          dry_run: true,
+        });
 
         expect(wouldBeWritten.isDone()).toBe(false);
       } finally {
@@ -408,6 +500,7 @@ describe('ghostfolio', () => {
       try {
         stubAuthAndAccounts();
         stubUpdate('123', 1000.12);
+        stubReadBack();
 
         const error = await ghostfolio
           .syncAccountBalances(actualBalances)
@@ -426,6 +519,97 @@ describe('ghostfolio', () => {
       } finally {
         cleanup();
       }
+    });
+
+    it('fails the account whose stored balance is not the one that was sent', async () => {
+      // A 2xx says the request was accepted, which is not the claim this tool makes.
+      // Reading the balances back is what turns it into "the balance in Ghostfolio is
+      // the balance from Actual Budget".
+      stubAuthAndAccounts();
+      stubUpdate('123', 1000.12);
+      stubUpdate('321', 1000.84);
+      stubReadBack(ghostfolioAccounts, new Map([['321', 999.99]]));
+
+      const error = await ghostfolio.syncAccountBalances(actualBalances).catch((e) => e);
+
+      expect(error.message).toMatch(
+        /stored a different balance than was sent for account Current Account/
+      );
+      // Both writes were accepted; only one of them holds the right value.
+      expect(error.summary).toMatchObject({ written: 2, confirmed: 1, failed: 1 });
+    });
+
+    it('keeps both balances out of the mismatch error', async () => {
+      stubAuthAndAccounts();
+      stubUpdate('123', 4242.42);
+      stubReadBack(ghostfolioAccounts, new Map([['123', 8675.309]]));
+
+      const error = await ghostfolio
+        .syncAccountBalances([
+          { name: 'Main Savings', balance: 424242 },
+          { name: 'Checking', balance: 100084 },
+        ])
+        .catch((e) => e);
+
+      expect(error.message).not.toContain('8675');
+      expect(error.message).not.toContain('4242');
+    });
+
+    it('reports the writes as unconfirmed when the balances cannot be read back', async () => {
+      // The writes were acknowledged; it is the confirmation that could not be made.
+      // Reporting a failure here would call a sync that most likely worked a failure,
+      // so it surfaces as confirmed < written instead.
+      stubAuthAndAccounts();
+      stubUpdate('123', 1000.12);
+      stubUpdate('321', 1000.84);
+      // 403 rather than 500: axios-retry retries a 5xx on an idempotent GET, so a
+      // 500 here would make the test wait out three backoffs to prove the same thing.
+      nock(baseUrl).get('/api/v1/account').reply(403, { error: 'forbidden' });
+
+      await expect(ghostfolio.syncAccountBalances(actualBalances)).resolves.toMatchObject({
+        written: 2,
+        confirmed: 0,
+        failed: 0,
+      });
+    });
+
+    it('reports a written account that is absent from the read-back as unconfirmed', async () => {
+      const logger = require('../src/logger');
+      const warn = jest.spyOn(logger, 'warn');
+
+      stubAuthAndAccounts();
+      stubUpdate('123', 1000.12);
+      stubUpdate('321', 1000.84);
+      // The second account has vanished between the write and the read.
+      stubReadBack([ghostfolioAccounts[0]]);
+
+      await expect(ghostfolio.syncAccountBalances(actualBalances)).resolves.toMatchObject({
+        written: 2,
+        confirmed: 1,
+        failed: 0,
+      });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(/Could not confirm the stored balance for account Current Account/),
+        expect.objectContaining({ account: 'Current Account' })
+      );
+    });
+
+    it('does not read anything back when nothing was written', async () => {
+      // One GET per run unless there is something to confirm. A dry run, or a night
+      // where no balance moved, must not spend a second request on nothing.
+      stubAuthAndAccounts([
+        { ...ghostfolioAccounts[0], balance: 1000.12 },
+        { ...ghostfolioAccounts[1], balance: 1000.84 },
+      ]);
+      const wouldBeReadBack = nock(baseUrl).get('/api/v1/account').reply(200, { accounts: [] });
+
+      await expect(ghostfolio.syncAccountBalances(actualBalances)).resolves.toMatchObject({
+        written: 0,
+        confirmed: 0,
+        unchanged: 2,
+      });
+
+      expect(wouldBeReadBack.isDone()).toBe(false);
     });
 
     it('sends nothing at all when the config file cannot be read or parsed', async () => {
@@ -670,7 +854,7 @@ describe('ghostfolio', () => {
       );
 
       expect(wouldBeWritten.isDone()).toBe(false);
-      expect(result).toBeNull();
+      expect(result).toBe('unchanged');
       expect(logBalanceUpdate).toHaveBeenLastCalledWith('Test Account', false, {
         service: 'ghostfolio',
         written: false,
@@ -681,69 +865,18 @@ describe('ghostfolio', () => {
       const AuditLogger = require('../src/utils/audit');
       const logBalanceUpdate = jest.spyOn(AuditLogger, 'logBalanceUpdate');
 
-      nock(baseUrl)
-        .put('/api/v1/account/123')
-        .reply(200, (uri, body) => ({ ...mockAccount, balance: body.balance }));
+      // The reply is what Ghostfolio actually sends: a bare Prisma Account, with no
+      // balance in it. Nothing here reads it, so a write is 'written', not confirmed.
+      nock(baseUrl).put('/api/v1/account/123').reply(200, { id: '123', name: 'Test Account' });
 
-      await ghostfolio.updateAccountBalance({ ...mockAccount, balance: 1.0 }, 100012);
+      await expect(
+        ghostfolio.updateAccountBalance({ ...mockAccount, balance: 1.0 }, 100012)
+      ).resolves.toBe('written');
 
       expect(logBalanceUpdate).toHaveBeenLastCalledWith('Test Account', true, {
         service: 'ghostfolio',
         written: true,
       });
-    });
-
-    it('fails the account when Ghostfolio echoes back a different balance', async () => {
-      // A 2xx used to be the whole success criterion. The response carries the
-      // account as it now stands, so the value actually stored is right there — and
-      // if it is not the value that was sent, the run has not done its job however
-      // cleanly the request completed.
-      const AuditLogger = require('../src/utils/audit');
-      const logBalanceUpdate = jest.spyOn(AuditLogger, 'logBalanceUpdate');
-
-      nock(baseUrl)
-        .put('/api/v1/account/123')
-        .reply(200, { ...mockAccount, balance: 999.99 });
-
-      await expect(ghostfolio.updateAccountBalance(mockAccount, 100012)).rejects.toThrow(
-        /stored a different balance than was sent for account Test Account/
-      );
-
-      // Not audited as a successful write, and neither balance appears anywhere.
-      expect(logBalanceUpdate).not.toHaveBeenCalledWith(
-        'Test Account',
-        true,
-        expect.objectContaining({ written: true })
-      );
-    });
-
-    it('keeps both balances out of the mismatch error', async () => {
-      nock(baseUrl)
-        .put('/api/v1/account/123')
-        .reply(200, { ...mockAccount, balance: 8675.309 });
-
-      const error = await ghostfolio.updateAccountBalance(mockAccount, 424242).catch((e) => e);
-
-      expect(error.message).not.toContain('8675');
-      expect(error.message).not.toContain('4242');
-    });
-
-    it('accepts a response that carries no balance to compare', async () => {
-      // A Ghostfolio version answering with an empty body, or a proxy that strips it,
-      // has not told us the write went wrong either. Unconfirmed is not failed — but
-      // it must say so rather than imply the value was checked.
-      const logger = require('../src/logger');
-      const warn = jest.spyOn(logger, 'warn');
-
-      nock(baseUrl).put('/api/v1/account/123').reply(200, { success: true });
-
-      await expect(ghostfolio.updateAccountBalance(mockAccount, 100012)).resolves.toEqual({
-        success: true,
-      });
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringMatching(/Could not confirm the stored balance/),
-        expect.objectContaining({ account: 'Test Account' })
-      );
     });
 
     it('refuses an account id carrying characters an id does not carry', async () => {

@@ -75,10 +75,20 @@ async function sync() {
 
     // Sync balances to Ghostfolio
     logger.info('Syncing balances to Ghostfolio...');
-    await ghostfolio.syncAccountBalances(balances);
+    const summary = await ghostfolio.syncAccountBalances(balances);
 
     const duration = Date.now() - startTime;
-    const outcome = { duration_ms: duration, accounts_synced: balances.length };
+
+    // The counts come from the sync, which is the only thing that knows them. This
+    // used to record `accounts_synced: balances.length` — the number of accounts in
+    // Actual Budget, so a budget with 20 accounts and two mappings audited a
+    // successful sync of 20. `accounts_in_budget` is that number under a name that
+    // is true of it.
+    const outcome = {
+      duration_ms: duration,
+      accounts_in_budget: balances.length,
+      ...summary,
+    };
 
     logger.info('Sync completed successfully', outcome);
     AuditLogger.logSync('completed', outcome);
@@ -97,10 +107,14 @@ async function sync() {
         ? 'network_error'
         : 'unknown_error';
 
+    // `error.summary` is set when the sync ran and some accounts failed, so a
+    // partial run records how many balances it did store. Absent for a failure
+    // before the write phase (bad config, no auth), where there is nothing to count.
     AuditLogger.logSync('failed', {
       error: message,
       error_type: errorType,
       duration_ms: duration,
+      ...(error?.summary ?? {}),
     });
 
     throw error;

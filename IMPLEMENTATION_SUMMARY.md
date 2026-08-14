@@ -191,7 +191,7 @@ built to refuse rather than guess. Implementation: [src/ghostfolio.js](src/ghost
 3. ✅ **All-zero refusal.** One zero is a real balance and is written; every mapped account reading zero at once is what an unfinished budget sync looks like, and writes nothing at all
 4. ✅ **Ambiguity refused, not resolved by picking.** A name matching more than one account on either side fails that mapping (`exactlyOneNamed`); `Array.prototype.find()` used to send the balance to whichever the API listed first
 5. ✅ **Currency compared, never converted.** The required `currency` per mapping is checked against the Ghostfolio account; a mismatch fails that account and the run continues
-6. ✅ **Every write read back.** Ghostfolio's update response carries the stored account; a stored balance differing from the one sent by `BALANCE_EPSILON` or more fails that account (`verifyStoredBalance`)
+6. ✅ **Every write read back.** After the writes, the account list is fetched again and each written balance compared with the one sent; a difference of `BALANCE_EPSILON` or more fails that account (`confirmStoredBalances`). This used to compare against the *update* response, which carries a Prisma `Account` — a model with no `balance` column at all — so the comparison never ran and every write logged "unconfirmed". A check that cannot fire is worse than no check
 7. ✅ **Unchanged balances are not rewritten** — the cheapest way to not store a wrong number is to not write
 8. ✅ **Per-mapping failure isolation** — the accounts that could be synced were, and the run exits non-zero with a count
 9. ✅ **`DRY_RUN=true`** resolves and reports every mapping without sending a write
@@ -216,7 +216,7 @@ removable.
 ### Audit Events
 1. **Authentication** — success/failure per service (Actual Budget, Ghostfolio)
 2. **Balance updates** — per account, recording whether the value actually changed and whether a request was sent (`written`, plus `dry_run` under `DRY_RUN`)
-3. **Sync operations** — started / completed / failed / skipped, with duration
+3. **Sync operations** — started / completed / failed / skipped, with duration and, once the sync has run, what it did: `mapped`, `resolved`, `changed`, `written`, `confirmed`, `unchanged`, `failed` and `dry_run`. A partially failed run carries the same counts, so the balances it did store are on the record. The completed record used to report `accounts_synced: balances.length` — the number of accounts in Actual Budget, so a budget with 20 accounts and two mappings audited a successful sync of 20; that number is now `accounts_in_budget`
 4. **Security events** — e.g. a rejected account name, a protected-path write
 5. **Validation failures** — environment and input validation
 
@@ -232,7 +232,7 @@ removable.
 
 - **Linting:** ✅ PASS — `eslint` (with `eslint-plugin-security`), 0 errors
 - **Unit tests:** ✅ PASS — `jest` + `nock`, one suite per module
-- **Test isolation:** logging silenced under `NODE_ENV=test` ([jest.setup.js](jest.setup.js))
+- **Test isolation:** logging silenced under `NODE_ENV=test`, and `nock.disableNetConnect()` so no test can open a socket ([jest.setup.js](jest.setup.js)). The suites point at `http://localhost:3333` — Ghostfolio's own default port — so a test missing an interceptor used to send a real balance `PUT` to whatever was listening on the developer's machine
 - **Thresholds:** [jest.config.js](jest.config.js) sets per-path coverage floors. They exist to stop
   coverage sliding backwards, so raise them when it improves rather than leaving headroom to delete
   tests into
