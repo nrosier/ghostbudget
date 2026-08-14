@@ -9,9 +9,9 @@ const path = require('path');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
 const constants = require('./config/constants');
+const { getEnv } = require('./config/env');
 const {
   validateConfig,
-  validateEnvironment,
   validateBalance,
   validateFactor,
   validateAccountName,
@@ -23,13 +23,9 @@ const {
 /**
  * The single account with this name, or an error saying why there isn't one.
  *
- * This was `Array.prototype.find()` on both sides of a mapping, which takes the
- * first match and says nothing about the rest. Neither system enforces unique
- * account names, so two accounts named "Savings" meant the balance went to
- * whichever one the API happened to list first — the other was never touched, the
- * run reported success, and nothing anywhere said the name had been ambiguous. For
- * a mapping that addresses accounts *by name*, more than one match is not something
- * to resolve by picking; it is a configuration that cannot be carried out.
+ * Neither system enforces unique account names, and a mapping that addresses accounts
+ * *by name* cannot resolve two matches by picking one. More than one match is a
+ * configuration that cannot be carried out. See docs/decisions.md.
  *
  * @param {Array} accounts - Accounts to search
  * @param {string} name - Exact account name to match
@@ -57,14 +53,11 @@ function exactlyOneNamed(accounts, name, side) {
 /**
  * Convert an Actual Budget balance to the value Ghostfolio stores.
  *
- * Rounding happens in minor units, before dividing. Actual Budget stores balances as
- * integer cents, but a factor need not be an integer, and float arithmetic on the way
- * out produced values like 1100.1320000000001 from 100012 * 1.1 / 100 — sent verbatim
- * to a financial API and stored as the account's balance.
+ * Rounding happens in minor units, before dividing: a non-integer factor applied to
+ * float major units produces values like 1100.1320000000001, which is not a balance.
  *
- * Shared rather than inlined because two places need the same number: the write, and
- * the read-back that confirms it. Two copies of this expression could drift by a cent
- * and turn every confirmed write into a reported mismatch.
+ * Shared rather than inlined because the write and the read-back that confirms it need
+ * the same number, to the cent. See docs/decisions.md.
  *
  * @param {number} balanceInMinorUnits - Validated Actual Budget balance
  * @param {number} factor - Validated positive multiplier
@@ -77,36 +70,28 @@ function toStoredBalance(balanceInMinorUnits, factor) {
 /**
  * The fields Ghostfolio's `UpdateAccountDto` accepts, besides `balance`.
  *
- * The account PUT used to hand-build its payload from seven fixed fields, which
- * meant any field the account model gained was sent absent — and on a PUT that is
- * a reset, not a no-op. The obvious fix is to spread the fetched account, but that
- * breaks against the live API: Ghostfolio's NestJS validation pipe runs with
- * `forbidNonWhitelisted: true`, so a single property outside the DTO fails the
- * whole request with a 400. The GET response carries plenty of them — computed
- * values, the expanded platform, tag objects.
+ * The fetched account is projected onto this set rather than spread: Ghostfolio's
+ * validation pipe runs with `forbidNonWhitelisted: true`, so one property outside the
+ * DTO fails the whole request with a 400, and the GET carries plenty of them. Nothing
+ * is invented, nothing outside the contract is sent, and a field added to the DTO is
+ * one entry away from being carried through.
  *
- * So the fetched account is projected onto the DTO's own field set instead:
- * nothing is invented, nothing outside the contract is sent, and a field added to
- * the DTO is one entry away from being carried through.
- *
- * `tags` is deliberately excluded. It is in the DTO, but the GET returns tag
- * *objects* while the DTO expects an array of ids, and Ghostfolio's update
- * implements tags as delete-all-then-create — so sending them back would either
- * fail validation or destroy the account's tags. Omitting the property leaves the
- * existing associations untouched.
+ * `tags` is deliberately excluded: the GET returns tag *objects* while the DTO expects
+ * ids, and the update implements tags as delete-all-then-create, so sending them back
+ * would either fail validation or destroy the account's tags. Omitting the property
+ * leaves the existing associations untouched.
  *
  * Verified against ghostfolio/ghostfolio@main:
  * libs/common/src/lib/dtos/update-account.dto.ts, apps/api/src/main.ts,
- * apps/api/src/app/account/account.service.ts.
+ * apps/api/src/app/account/account.service.ts. See docs/decisions.md.
  */
 const UPDATABLE_ACCOUNT_FIELDS = ['comment', 'currency', 'id', 'name'];
 
 class GhostfolioAPI {
   constructor() {
-    // Validated once, here. The environment cannot change under a running process,
-    // and every value this client needs is taken from the result — authenticate()
-    // used to re-run the whole schema on each call for the sake of one field.
-    const env = validateEnvironment(process.env);
+    // Every value this client needs comes from the one validated environment. See
+    // config/env.js for why the validation is no longer inline here.
+    const env = getEnv();
     this.baseURL = env.GHOSTFOLIO_URL.replace(/\/$/, '');
     // Ghostfolio's anonymous-user security token, exchanged for a short-lived
     // authToken by authenticate(). `accessToken` below holds that authToken.
@@ -117,9 +102,9 @@ class GhostfolioAPI {
     // process.env at each write, so a run cannot change mode halfway through.
     this.dryRun = env.DRY_RUN === true;
 
-    // A local, not a field: the only reader is the axiosRetry call below. As
-    // `this.maxRetries` it looked like state something outside might consult.
-    const maxRetries = env.MAX_RETRIES ?? constants.MAX_RETRIES;
+    // A local, not a field: the only reader is the axiosRetry call below. The schema
+    // defaults this from constants.MAX_RETRIES, so there is no fallback to apply here.
+    const maxRetries = env.MAX_RETRIES;
 
     // Create secure axios instance with enhanced TLS
     this.axiosInstance = axios.create({
@@ -132,10 +117,9 @@ class GhostfolioAPI {
         // cipher allowlist was removed rather than extended.
         minVersion: constants.TLS_MIN_VERSION,
         maxVersion: constants.TLS_MAX_VERSION,
-        // A sync issues its requests one at a time, so the pool never holds more
-        // than one socket and sizing it is meaningless. keepAlive is the part that
-        // earns its place: it reuses that socket instead of re-handshaking TLS for
-        // every account.
+        // Reuses the one socket a sequential sync needs instead of re-handshaking TLS
+        // for every account. The pool is deliberately not sized — see
+        // docs/decisions.md.
         keepAlive: true,
       }),
       validateStatus: (status) => status >= 200 && status < 300,
@@ -160,26 +144,11 @@ class GhostfolioAPI {
       },
     });
 
-    // Retry is the only resilience layer here, and deliberately so.
-    //
-    // There was a rate limiter and a circuit breaker wrapped around this instance.
-    // Neither could do its job in this process, and the breaker did active harm.
-    //
-    // The limiter allowed 10 requests per second, but a sync issues its requests
-    // strictly sequentially — `await` per account in syncAccountBalances — so at
-    // most one is ever in flight. One-at-a-time is a tighter bound than 10/s, and
-    // the queue in front of it never queued anything.
-    //
-    // The breaker opened at a 50% error rate over the shared request stream. In a
-    // run where authentication and the account fetch succeed and then some account
-    // PUTs fail — a couple of stale mappings, say — the third failure opened it,
-    // and from that point every remaining account was rejected locally with
-    // "Breaker is open". So three bad mappings stopped the accounts behind them
-    // from being written at all, and replaced each one's real Ghostfolio error in
-    // the summary and the audit trail with the breaker's own message. Its 30 s
-    // resetTimeout could not help: a sync is a one-shot process that exits long
-    // before it elapses. The wall-clock backstop is the scheduler's
-    // SYNC_TIMEOUT_MS, which bounds the whole run and escalates to SIGKILL.
+    // Retry is the only resilience layer here, deliberately: a rate limiter and a
+    // circuit breaker were both removed, the breaker because it stopped accounts
+    // behind a few bad mappings from being written at all. See docs/decisions.md. The
+    // wall-clock backstop is the scheduler's SYNC_TIMEOUT_MS, which bounds the whole
+    // run and escalates to SIGKILL.
   }
 
   async authenticate() {
@@ -218,10 +187,8 @@ class GhostfolioAPI {
       throw new Error('Not authenticated. Call authenticate() first');
     }
 
-    // There is no cache here any more. One was maintained with a configurable TTL
-    // and then invalidated after every balance update — in a process that fetches
-    // the account list exactly once and exits, so it never served a single read.
-    // CACHE_TTL_MINUTES could not have any effect whatever it was set to.
+    // No cache: this process fetches the account list once and exits. See
+    // docs/decisions.md for the one that used to be here.
     try {
       logger.debug('Fetching Ghostfolio accounts...');
 
@@ -257,21 +224,12 @@ class GhostfolioAPI {
    * Ghostfolio is the balance from Actual Budget", and the only way to establish it
    * is to ask Ghostfolio what it now holds.
    *
-   * This used to compare against the balance in the update response, which cannot
-   * work: `PUT /api/v1/account/:id` returns a Prisma `Account`, and that model has
-   * no `balance` column at all — balances live in `AccountBalance` rows keyed by
-   * (accountId, date), which `updateAccount` writes separately under today's date.
-   * So the response never carried a balance, the comparison never ran, and every
-   * write logged "could not confirm" instead. A check that cannot fire is worse than
-   * no check, because the log says something was verified.
+   * The account list is what carries `balance` — Ghostfolio derives it as the most
+   * recent non-future `AccountBalance` value, which after a write today is the value
+   * written. The update response does not carry one at all, which is why this reads the
+   * list back rather than checking what the PUT returned; see docs/decisions.md.
    *
-   * The account list, by contrast, does carry `balance`: Ghostfolio derives it as
-   * the most recent non-future `AccountBalance` value, which after a write today is
-   * the value written. One extra GET per run confirms every write in it.
-   *
-   * No balance appears in any message or log line, here or anywhere else. The
-   * operator can read both values in Ghostfolio's own UI; a log file on a mounted
-   * volume is not the place for them.
+   * No balance appears in any message or log line, here or anywhere else.
    *
    * @param {Array<{ghostfolioAccount: Object, sentBalance: number}>} writes - Completed writes
    * @returns {Promise<{confirmed: number, errors: Array<string>}>} Confirmation outcome
@@ -330,8 +288,7 @@ class GhostfolioAPI {
    * Returns which of the three things happened, because the caller has to be able
    * to report it and cannot work it out for itself: `'written'` (the request was
    * accepted), `'unchanged'` (already correct, nothing sent) or `'dry_run'` (would
-   * have been written). This used to return the update response body, which no
-   * caller read and which carries nothing worth reading.
+   * have been written).
    *
    * `'written'` means accepted, not confirmed — confirming is confirmStoredBalances'
    * job, once the writes are done.
@@ -366,12 +323,9 @@ class GhostfolioAPI {
         !Number.isFinite(previousBalance) ||
         Math.abs(previousBalance - newBalance) >= constants.BALANCE_EPSILON;
 
-      // Nothing to do, so nothing is sent. The PUT used to fire regardless — the
-      // `changed` flag only decided what the audit trail said about it — which
-      // meant a nightly run rewrote every mapped account's balance every night,
-      // including the ones that had not moved. Every write is an opportunity to
-      // store the wrong number; the cheapest way to not store a wrong number is to
-      // not write. On a typical run this skips all of them.
+      // Nothing to do, so nothing is sent. Every write is an opportunity to store the
+      // wrong number, and on a typical run this skips all of them. See
+      // docs/decisions.md.
       if (!changed) {
         logger.info(`Balance for account ${accountName} is already correct; no write sent`);
         AuditLogger.logBalanceUpdate(accountName, false, {
@@ -457,7 +411,9 @@ class GhostfolioAPI {
       configData = JSON.parse(configContent);
     } catch (error) {
       logger.error('Failed to read or parse config file', sanitizeError(error));
-      throw new Error(`Config file error: ${errorMessageOf(error)}`);
+      // `cause` keeps the original for a caller that wants it. It cannot widen what
+      // gets logged: sanitizeError names the three fields it copies out.
+      throw new Error(`Config file error: ${errorMessageOf(error)}`, { cause: error });
     }
 
     return validateConfig(configData);
@@ -488,11 +444,8 @@ class GhostfolioAPI {
     );
 
     // Neither API states the currency of an Actual Budget balance, so the config
-    // declares it and this compares. Without it a balance denominated in one
-    // currency was written verbatim into an account denominated in another — no
-    // error, no warning, just the wrong amount of money from then on. `factor` is
-    // not a substitute: using it as an exchange rate freezes that rate into the
-    // config, where it silently goes stale.
+    // declares it and this compares. `factor` is not a substitute — see
+    // docs/decisions.md.
     const accountCurrency = String(ghostfolioAccount.currency ?? '')
       .trim()
       .toUpperCase();
@@ -520,10 +473,9 @@ class GhostfolioAPI {
   /**
    * Sync every mapped account's balance, and report what happened.
    *
-   * The summary is the point of the return value: the caller cannot derive it. It
-   * knows how many accounts Actual Budget has, which is neither the number mapped
-   * nor the number written, and the top-level audit record used to report that
-   * count as `accounts_synced` — 20 for a budget with 20 accounts and two mappings.
+   * The summary is the point of the return value: the caller cannot derive it. It knows
+   * how many accounts Actual Budget has, which is neither the number mapped nor the
+   * number written — see docs/decisions.md for what that once audited.
    *
    * `changed + unchanged === resolved`, and `written === changed` unless this is a
    * dry run, where it is 0. `confirmed` is how many of those writes were read back
@@ -537,9 +489,8 @@ class GhostfolioAPI {
    * @throws {Error} If any mapping failed, or if the all-zero gate refused the run
    */
   async syncAccountBalances(actualBalances) {
-    // Config first. It used to be read after authenticating, so a mistyped
-    // config.json still exchanged the security token for an auth token and fetched
-    // the account list before failing on something local to this machine.
+    // Config first, so a mistyped config.json fails before the security token is
+    // exchanged for an auth token and the account list is fetched.
     const config = this.readAccountMappings();
 
     await this.authenticate();
@@ -547,13 +498,9 @@ class GhostfolioAPI {
 
     const errors = [];
 
-    // Phase one: work out every intended write. Nothing is sent in this loop.
-    //
-    // Resolution used to be interleaved with writing, one mapping at a time, which
-    // meant the first accounts were already written before the later ones had been
-    // looked at — so a check that depends on the whole set could not exist. Both
-    // phases still record per-mapping failures and carry on, so one bad mapping
-    // does not cost the others their sync.
+    // Phase one: work out every intended write. Nothing is sent in this loop, which is
+    // what lets the gate below see the whole set. Both phases record per-mapping
+    // failures and carry on, so one bad mapping does not cost the others their sync.
     const targets = [];
     for (const mapping of config.accounts) {
       try {
@@ -568,14 +515,11 @@ class GhostfolioAPI {
 
     // The gate, and the reason there are two phases.
     //
-    // A zero is a valid balance — an emptied account really does hold nothing — so
-    // no single value can be rejected on its own. Every mapped account reading zero
-    // at once is a different claim, and not one a real set of accounts makes. It is
-    // what a budget that downloaded but did not apply its sync messages looks like,
-    // or a wrong ACTUAL_BUDGET_SYNC_ID pointing at an empty budget. None of those
-    // throw, so every guard upstream passes and the run would overwrite real
-    // balances with zeros and report success. Refusing here, before phase two,
-    // means not one account is touched.
+    // A zero is a valid balance, so no single value can be rejected on its own. Every
+    // mapped account reading zero at once is a different claim, and one that nothing
+    // upstream throws on: it is what a failed or empty Actual Budget download looks
+    // like. Refusing here, before phase two, means not one account is touched. See
+    // docs/decisions.md.
     if (targets.length > 0 && targets.every((target) => target.balance === 0)) {
       throw new Error(
         `Refusing to sync: all ${targets.length} resolved account(s) report a zero balance, ` +
@@ -662,4 +606,20 @@ class GhostfolioAPI {
   }
 }
 
-module.exports = new GhostfolioAPI();
+let client = null;
+
+/**
+ * This process's Ghostfolio client, constructed on first use.
+ *
+ * On demand rather than at require time, because the constructor validates the
+ * environment: constructing it here puts that failure inside sync()'s try, where it is
+ * logged, audited and flushed like every other one. See config/env.js.
+ *
+ * @returns {GhostfolioAPI} The client
+ */
+function getClient() {
+  client ??= new GhostfolioAPI();
+  return client;
+}
+
+module.exports = { GhostfolioAPI, getClient };

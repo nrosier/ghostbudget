@@ -8,11 +8,9 @@ const constants = require('../config/constants');
 /**
  * Paths that must never be used as the Actual Budget data directory.
  *
- * The container entrypoint used to run `chown -R` against this value as root, so
- * `ACTUAL_BUDGET_DATA_DIR=/` rewrote ownership across the whole filesystem. That
- * chown is gone — the container no longer has a root phase — but the value still
- * decides where a SQLite database is created and where the process demands write
- * access, so pointing it at a system directory is never what an operator meant.
+ * The value decides where a SQLite database is created and where the process demands
+ * write access, so pointing it at a system directory is never what an operator meant.
+ * See docs/decisions.md for the root `chown -R` that first made this urgent.
  */
 const PROTECTED_DATA_DIRS = new Set([
   '/',
@@ -81,12 +79,9 @@ const configSchema = Joi.object({
  * Schema for validating environment variables
  */
 const envSchema = Joi.object({
-  // Shape only. Which schemes are acceptable for which hosts is decided by
-  // assertTransportSecurity below, which needs the parsed host to say anything
-  // useful. The host allowlist that used to live in a pattern here is gone: it
-  // permitted only localhost, 127.0.0.1 and dotted names with a TLD, so
-  // `http://actual_server:5006` — a Docker Compose service name, which is what the
-  // recommended deployment actually uses — was rejected outright.
+  // Shape only, and no host allowlist — see docs/decisions.md. Which schemes are
+  // acceptable for which hosts is decided by assertTransportSecurity below, which needs
+  // the parsed host to say anything useful.
   ACTUAL_BUDGET_URL: Joi.string()
     .uri({ scheme: ['http', 'https'] })
     .required(),
@@ -103,13 +98,41 @@ const envSchema = Joi.object({
   // only thing this tool does to Ghostfolio is overwrite balances, so being able
   // to check a new or edited config.json without doing that is worth one flag.
   DRY_RUN: Joi.boolean().default(false),
-  // CACHE_TTL_MINUTES and BATCH_SIZE are both gone, for the same reason: each
-  // configured something that could not take effect in a one-shot process — a
-  // cache that never served a read, and batches over a synchronous local database.
-  // Unknown variables are allowed, so an operator who still has either set in a
-  // .env file sees no error; it simply does nothing, as before.
-  MAX_RETRIES: Joi.number().integer().min(0).max(10).default(3),
+  // CACHE_TTL_MINUTES and BATCH_SIZE are gone — see docs/decisions.md. Unknown
+  // variables are allowed, so an operator who still has either set in a .env file sees
+  // no error; it simply does nothing, as before.
+  //
+  // Defaulted from the constant rather than a literal, so there is one home for this
+  // number rather than one per reader.
+  MAX_RETRIES: Joi.number().integer().min(0).max(10).default(constants.MAX_RETRIES),
 }).unknown(true); // Allow other env vars
+
+/**
+ * One line per distinct problem, naming the mappings that have it.
+ *
+ * `abortEarly: false` reports every failure, and a schema failure is usually the same
+ * failure repeated — six accounts missing `currency` produce six verbatim copies of one
+ * 230-character explanation. The count and the paths are what differ between them, so
+ * those are what is kept. See docs/decisions.md.
+ *
+ * @param {Object} error - A Joi ValidationError
+ * @returns {string} Deduplicated details, joined with '; '
+ */
+function summarizeDetails(error) {
+  const paths = new Map();
+
+  for (const detail of error.details) {
+    const seen = paths.get(detail.message) ?? [];
+    seen.push(detail.path.join('.'));
+    paths.set(detail.message, seen);
+  }
+
+  return [...paths]
+    .map(([message, where]) =>
+      where.length > 1 ? `${message} [${where.length}: ${where.join(', ')}]` : message
+    )
+    .join('; ');
+}
 
 /**
  * Validate configuration object
@@ -124,7 +147,7 @@ function validateConfig(config) {
   });
 
   if (error) {
-    const details = error.details.map((d) => d.message).join('; ');
+    const details = summarizeDetails(error);
     logger.error('Configuration validation failed', { details });
     throw new Error(`Invalid configuration: ${details}`);
   }
@@ -180,18 +203,10 @@ function isPrivateHost(hostname) {
 /**
  * Refuse to send a credential in plaintext to a host that is not local.
  *
- * This replaces a rule that required HTTPS only when `NODE_ENV=production`, which
- * was wrong in both directions. It was too strict for the deployment this project
- * recommends: the image sets `NODE_ENV=production`, so a compose file talking to
- * `http://actual_server:5006` over the container network could not start at all —
- * and `.env.example`, which ships `NODE_ENV=production` alongside `http://localhost`
- * URLs, could not start either. It was also too lax where it mattered, because a
- * developer who had not set NODE_ENV sent the Actual Budget password and the
- * Ghostfolio token in the clear to whatever remote host was configured.
- *
- * Keying on the host instead protects the case that is actually dangerous —
- * credentials crossing a network someone else can see — in every environment, and
- * permits the case that is not.
+ * Keyed on the host, in every environment, and deliberately not on `NODE_ENV` — that
+ * rule was wrong in both directions, see docs/decisions.md. This protects the case that
+ * is actually dangerous, credentials crossing a network someone else can see, and permits
+ * the case that is not.
  *
  * @param {string} name - Environment variable name, for the error message
  * @param {string} value - URL to check
@@ -236,7 +251,7 @@ function validateEnvironment(env) {
   });
 
   if (error) {
-    const details = error.details.map((d) => d.message).join('; ');
+    const details = summarizeDetails(error);
     logger.error('Environment validation failed', { details });
     AuditLogger.logValidationFailure('environment', { details });
     throw new Error(`Invalid environment variables: ${details}`);
@@ -312,12 +327,9 @@ function validateAccountId(id) {
 /**
  * Validate a per-account multiplication factor.
  *
- * Distinct from validateBalance for a reason: a balance may legitimately be
- * negative or zero, a factor may not. Reusing the balance validator here meant
- * `factor: 0` (every balance silently becomes 0) and `factor: -1` (every sign
- * flipped) passed validation on the public `updateAccountBalance` path. The Joi
- * config schema already enforces `positive()`, so the gap only affected direct
- * callers — which is exactly the boundary a public method has to defend.
+ * Distinct from validateBalance for a reason: a balance may legitimately be negative or
+ * zero, a factor may not — `factor: 0` makes every balance 0 and `factor: -1` flips every
+ * sign. See docs/decisions.md.
  *
  * @param {*} factor - Factor value to validate
  * @returns {number} Validated factor
@@ -377,10 +389,8 @@ function validateAccountName(name) {
  * Validate the Actual Budget data directory.
  *
  * Called once at scheduler startup rather than per sync: a data directory that is
- * missing or unwritable is a deployment fault, and failing at startup with the
- * resolved path in the message beats an opaque SQLite error every night at 05:00.
- * The old entrypoint silently skipped its `[ -d ]` guard when the path did not
- * exist, and Actual then wrote to a location that was not persisted.
+ * missing or unwritable is a deployment fault, and failing at startup with the resolved
+ * path in the message beats an opaque SQLite error every night at 05:00.
  *
  * @param {*} dir - Candidate directory (typically process.env.ACTUAL_BUDGET_DATA_DIR)
  * @returns {string|undefined} Resolved absolute path, or undefined if unset
@@ -567,12 +577,9 @@ function sanitizeError(error) {
   };
 }
 
-// There was a generic validateApiResponse(response, requiredFields) here. Both of
-// its call sites in ghostfolio.js followed it immediately with a stricter check of
-// the same field — `in` is satisfied by a present-but-null `authToken`, and by an
-// `accounts` that is a string — so the specific check was doing the work and the
-// generic one only decided which of two error messages came out. The checks that
-// remain are at their point of use in ghostfolio.js.
+// There is no generic API-response validator here on purpose: a `requiredFields` check
+// is satisfied by a present-but-null value, so each response is checked for what it has
+// to be at its point of use in ghostfolio.js. See docs/decisions.md.
 
 module.exports = {
   validateConfig,

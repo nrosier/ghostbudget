@@ -1,6 +1,7 @@
 const tls = require('tls');
 
 const constants = require('../src/config/constants');
+const { applyTestEnv } = require('./helpers/env');
 
 // @actual-app/api pulls in a native better-sqlite3 build; nothing here needs it.
 jest.mock('@actual-app/api');
@@ -31,14 +32,9 @@ describe('TLS floor', () => {
       tls.DEFAULT_MIN_VERSION = 'TLSv1';
       jest.resetModules();
 
-      process.env.GHOSTFOLIO_URL = 'http://localhost:3333';
-      process.env.GHOSTFOLIO_TOKEN = '0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9';
-      process.env.ACTUAL_BUDGET_URL = 'http://localhost:5006';
-      process.env.ACTUAL_BUDGET_PASS = 'test-pass';
-      process.env.ACTUAL_BUDGET_SYNC_ID = 'test-sync-id';
-
-      // The whole point is that *either* entry point installs the floor, and the
-      // ids are the two literals in the loop header above — nothing external.
+      // No environment set up here on purpose: the floor is installed by the require
+      // itself, which is the claim, and neither module validates anything until it is
+      // asked to do work.
       // eslint-disable-next-line security/detect-non-literal-require
       require(moduleId);
 
@@ -51,14 +47,10 @@ describe('TLS floor', () => {
     // fails the handshake outright against a server holding an ECDSA certificate —
     // Let's Encrypt ECDSA and Cloudflare both issue them. Its TLS 1.3 entries were
     // inert anyway: Node's `ciphers` option governs TLS 1.2 and below only.
-    process.env.GHOSTFOLIO_URL = 'http://localhost:3333';
-    process.env.GHOSTFOLIO_TOKEN = '0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9';
-    process.env.ACTUAL_BUDGET_URL = 'http://localhost:5006';
-    process.env.ACTUAL_BUDGET_PASS = 'test-pass';
-    process.env.ACTUAL_BUDGET_SYNC_ID = 'test-sync-id';
     jest.resetModules();
+    applyTestEnv();
 
-    const ghostfolio = require('../src/ghostfolio');
+    const ghostfolio = require('../src/ghostfolio').getClient();
     const agentOptions = ghostfolio.axiosInstance.defaults.httpsAgent.options;
 
     expect(agentOptions.minVersion).toBe('TLSv1.2');

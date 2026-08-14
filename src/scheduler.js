@@ -2,27 +2,14 @@
 /**
  * GhostBudget scheduler — the container's long-lived process.
  *
- * This replaces the previous BusyBox `crond` setup, and with it an entire class
- * of fragility:
+ * It runs as `nodejs` from the first instruction, inherits the environment (secrets
+ * included) into each run by fork rather than by file, and hands CRON_TASK to a real
+ * parser instead of a shell. This replaced a BusyBox `crond` setup that could do none
+ * of those things; see docs/decisions.md for what each of them was worth.
  *
- * - The container no longer has a root phase. `crond` had to start as root to
- *   install a crontab for another user, so PID 1 ran as root for the container's
- *   whole lifetime and only the sync itself dropped to `nodejs`. This process
- *   runs as `nodejs` from the first instruction.
- * - Secrets no longer depend on a BusyBox quirk. The old design wrote
- *   non-sensitive variables to /app/project_env.sh and relied on BusyBox `crond`
- *   leaking its own environment to jobs for ACTUAL_BUDGET_PASS and
- *   GHOSTFOLIO_TOKEN to arrive at all. Vixie cron and cronie build a clean
- *   environment and would have dropped both, so any change of base image would
- *   have broken authentication. A child process inherits the environment
- *   directly, by definition.
- * - CRON_TASK is no longer interpolated into a shell command line, so a real
- *   parser can validate it instead of a character allowlist.
- *
- * Each run is still a separate OS process. That is deliberate: @actual-app/api
- * opens a native better-sqlite3 handle and a sync that dies before
- * api.shutdown() leaves it behind, so process-per-run keeps a bad run from
- * poisoning the next one — the same isolation cron gave us for free.
+ * Each run is still a separate OS process, deliberately: @actual-app/api opens a native
+ * better-sqlite3 handle and a sync that dies before api.shutdown() leaves it behind, so
+ * process-per-run keeps a bad run from poisoning the next one.
  */
 
 // Load environment variables first
@@ -60,11 +47,9 @@ const CRON_NICKNAMES = [
 /**
  * Validate and normalize a CRON_TASK value.
  *
- * The old shell validation only checked which characters appeared, so it accepted
- * `* * * * * * *` and rejected `@daily`. Both are fixed here: the field count is
- * checked, nicknames are supported, and croner parses the pattern so out-of-range
- * values and patterns that can never match are caught at startup instead of
- * turning into a schedule nobody asked for.
+ * The field count is checked, nicknames are supported, and croner parses the pattern, so
+ * out-of-range values and patterns that can never match are caught at startup instead of
+ * turning into a schedule nobody asked for. See docs/decisions.md.
  *
  * @param {*} expression - Raw CRON_TASK value
  * @returns {{pattern: string, upcoming: Date[]}} Normalized pattern and next run times
@@ -119,23 +104,38 @@ function normalizeSchedule(expression) {
 }
 
 /**
+ * What the scheduler knows before it has done anything.
+ *
+ * A function rather than a literal because two places need these twelve fields: the
+ * initial value, and __resetForTests. Written out twice they drift, and a field in one
+ * but not the other leaks between test cases as an unrelated failure.
+ *
+ * `pid` is excluded on purpose: it is the process's, not the run's, and resetting it
+ * to a different value would be a lie about which process wrote the state file.
+ *
+ * @returns {Object} A fresh state object
+ */
+function initialState() {
+  return {
+    schedule: null,
+    startedAt: null,
+    heartbeatAt: null,
+    nextRunAt: null,
+    running: false,
+    runStartedAt: null,
+    lastRunFinishedAt: null,
+    lastRunOutcome: null,
+    lastRunExitCode: null,
+    lastRunDurationMs: null,
+    runCount: 0,
+    failureCount: 0,
+  };
+}
+
+/**
  * Scheduler state, mirrored to disk for the container health check.
  */
-const state = {
-  pid: process.pid,
-  schedule: null,
-  startedAt: null,
-  heartbeatAt: null,
-  nextRunAt: null,
-  running: false,
-  runStartedAt: null,
-  lastRunFinishedAt: null,
-  lastRunOutcome: null,
-  lastRunExitCode: null,
-  lastRunDurationMs: null,
-  runCount: 0,
-  failureCount: 0,
-};
+const state = { pid: process.pid, ...initialState() };
 
 let job = null;
 let heartbeat = null;
@@ -191,9 +191,8 @@ function runSync() {
     let timedOut = false;
     let killTimer = null;
 
-    // stdout/stderr are inherited so the sync's console output reaches `docker
-    // logs` directly. The old design appended it to /var/log/cron.log and kept a
-    // `tail -f` alive to relay it.
+    // stdout/stderr are inherited so the sync's console output reaches `docker logs`
+    // directly, with no relay process in between.
     child = spawn(process.execPath, [SYNC_SCRIPT], {
       cwd: APP_ROOT,
       env: process.env,
@@ -300,7 +299,7 @@ async function onTick() {
 
   if (state.running) {
     // Overlapping runs would have two processes opening the same Actual Budget
-    // SQLite database. BusyBox cron happily did exactly that.
+    // SQLite database.
     logger.warn('Skipping scheduled sync: previous run is still in progress', {
       run_started_at: state.runStartedAt,
     });
@@ -437,20 +436,7 @@ module.exports = {
    * @returns {void}
    */
   __resetForTests() {
-    Object.assign(state, {
-      schedule: null,
-      startedAt: null,
-      heartbeatAt: null,
-      nextRunAt: null,
-      running: false,
-      runStartedAt: null,
-      lastRunFinishedAt: null,
-      lastRunOutcome: null,
-      lastRunExitCode: null,
-      lastRunDurationMs: null,
-      runCount: 0,
-      failureCount: 0,
-    });
+    Object.assign(state, initialState());
     if (job) {
       job.stop();
     }

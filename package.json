@@ -11,14 +11,14 @@
     "test": "NODE_ENV=test jest",
     "test:watch": "NODE_ENV=test jest --watch",
     "test:coverage": "NODE_ENV=test jest --coverage",
-    "lint": "eslint . --ext .js --max-warnings=0",
-    "lint:fix": "eslint . --ext .js --fix",
+    "lint": "eslint . --max-warnings=0",
+    "lint:fix": "eslint . --fix",
     "format": "prettier --write \"**/*.{js,json,md}\"",
     "install:ci": "npm ci --ignore-scripts && npm rebuild better-sqlite3",
     "install:prod": "npm ci --omit=dev --ignore-scripts && npm rebuild better-sqlite3"
   },
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@actual-app/api": "^26.8.1",
     "axios": "1.19.0",
@@ -30,13 +30,11 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@typescript-eslint/eslint-plugin": "8.67.0",
     "eslint": "10.8.1",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.6",
     "eslint-plugin-security": "4.0.1",
     "jest": "30.4.2",
-    "jsdoc": "^4.0.5",
     "nock": "14.0.17",
     "prettier": "3.9.6"
   },

@@ -72,6 +72,45 @@ repository to stay informed.
 
 ---
 
+## Design principles
+
+The controls below are each individually justified, but they follow from a small
+number of decisions about what this tool is. They are recorded here because a
+reader who knows them can predict most of what follows, and because a change that
+contradicts one of them is worth noticing.
+
+1. **Refusing beats guessing, on every write path.** An ambiguous account name, a
+   currency that disagrees, an all-zero read, a stored value that does not match
+   what was sent — each of these ends in nothing being written rather than
+   something plausible. The output of this tool is a number its operator will read
+   as a bank balance, so an absent update is recoverable in a way a wrong one is
+   not.
+2. **Balance values appear nowhere but the request body.** Not in logs, not in
+   audit records, not in error messages — which is why the guards name the account
+   or the limit instead of the value. `error.log` sits on a mounted volume and
+   outlives the process.
+3. **One request in flight at a time.** The sync `await`s each account in turn.
+   Sequential execution is a tighter bound than any limiter would impose, and it
+   makes each account's failure independently attributable.
+4. **Retry, and nothing above it.** Transient failures are worth retrying; a
+   shared-state control that can refuse requests on another account's behalf is
+   not appropriate for a run this short. The wall-clock backstop is the
+   scheduler's `SYNC_TIMEOUT_MS`, escalating `SIGTERM` to `SIGKILL`.
+5. **The host decides the transport rule, not `NODE_ENV`.** Plaintext is refused
+   wherever the traffic could leave a local network and accepted where it cannot.
+   What determines the exposure is the host.
+6. **Prefer the standard library.** `crypto.randomUUID()` over a UUID package —
+   the same CSPRNG, one fewer dependency to install, audit and mock around.
+
+Several controls that once appeared in this document have since been **removed**
+rather than fixed, on the evidence that they could not function in a one-shot
+sequential process: a circuit breaker, a rate limiter, response caching, batch
+processing, and a generic API-response validator. The two that bear on the
+security posture are covered under "Resilience & abuse protection" below; all of
+them, with what each cost, are in [docs/decisions.md](docs/decisions.md).
+
+---
+
 ## Security Controls Implemented
 
 ### Input & configuration validation ✅
@@ -320,6 +359,15 @@ version.
   container root filesystem is mounted `read_only` with a small tmpfs at `/tmp`.
   A compromised sync cannot rewrite `src/` and persist across runs.
 - Build toolchain removed after native-module compilation.
+- **The image ships no package manager.** `npm`, `npx`, `corepack` and `yarn` are
+  deleted in the same layer that used them, so the bytes never enter the image.
+  Trivy scans the whole filesystem, and the npm bundled in `node:lts-alpine`
+  vendors its own dependency tree — `tar`, `brace-expansion`, `ip-address` and
+  `undici` there accounted for every fixable CRITICAL/HIGH finding in the image
+  while the application's own production tree was clean. Nothing needs them at
+  runtime: the entrypoint is `node`, the health check is `node`, and the scheduler
+  forks `process.execPath`. A sync can still be run by hand with
+  `docker exec <name> node src/index.js`.
 - **Dependency install scripts are denied by default.** Installs run
   `npm ci --ignore-scripts`, and `better-sqlite3` is then rebuilt _by name_
   because `@actual-app/api` loads it natively. This applies to the image build, to
@@ -525,13 +573,30 @@ rest are the operator's responsibility.
       is actually denominated in, and maps a cash account rather than a brokerage
       total (a Ghostfolio `balance` is cash; holdings are counted separately).
 - [ ] One `DRY_RUN=true` run has been made after the last `config.json` edit.
-- [ ] The published image tag in `docker-compose.yml` is the one you intend to
-      run (it is pinned to a release, not `latest` — bump it deliberately).
+- [ ] The published image tag in `docker-compose.yml` is the one you intend to run.
+      It ships as `:latest`, so a restart rolls out whatever CI published most
+      recently. To pin, use the commit tag — `niqck/ghostbudget:<full 40-char SHA>`
+      — which is the only other tag published; `docker inspect` reports it as
+      `org.opencontainers.image.revision`.
 - [ ] Logs are aggregated and monitored.
 - [ ] Access tokens have been rotated and scoped to least privilege.
 - [ ] Network policies restrict container egress to the two API hosts.
 - [ ] `npm audit` and the CI security workflow pass.
 - [ ] The data volume is backed up, and restores have been tested.
+
+---
+
+## Related documents
+
+- [README.md](README.md) — installation, configuration, and the operator-facing
+  version of [what is written and when it is not](README.md#what-is-written-and-when-it-is-not).
+- [docs/decisions.md](docs/decisions.md) — why the code has the shape it has, in the
+  cases where that shape was arrived at by removing or replacing something that did
+  not work. The rule each entry produced lives in the code; this is the reasoning
+  behind it, so a future change knows what it is undoing.
+- [docs/history/audit-2026-08-13.md](docs/history/audit-2026-08-13.md) — the archived
+  audit that produced most of the hardening in this document. Point-in-time: its line
+  numbers refer to a commit that no longer matches the tree.
 
 ---
 

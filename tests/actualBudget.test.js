@@ -1,5 +1,7 @@
 const api = require('@actual-app/api');
 
+const { applyTestEnv } = require('./helpers/env');
+
 // Mock the actual-api module
 jest.mock('@actual-app/api');
 
@@ -10,21 +12,7 @@ describe('actualBudget', () => {
     // Clear all mocks
     jest.clearAllMocks();
 
-    // Mock console to avoid noise in tests
-    jest.spyOn(console, 'log').mockImplementation(() => {});
-    jest.spyOn(console, 'error').mockImplementation(() => {});
-
-    // Set required environment variables. validateEnvironment() validates the
-    // full application schema, so both Actual Budget and Ghostfolio vars must
-    // be present for the environment to be considered valid.
-    process.env.ACTUAL_BUDGET_URL = 'http://localhost:5006';
-    process.env.ACTUAL_BUDGET_PASS = 'test-pass';
-    process.env.ACTUAL_BUDGET_SYNC_ID = 'test-sync-id';
-    process.env.ACTUAL_BUDGET_DATA_DIR = '/test/dir';
-    process.env.GHOSTFOLIO_URL = 'http://localhost:3333';
-    // A UUID, because that is the shape of a Ghostfolio anonymous-user token and
-    // validateEnvironment enforces a 16-character minimum.
-    process.env.GHOSTFOLIO_TOKEN = '0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9';
+    applyTestEnv();
 
     // Import the module in each test to get a fresh instance
     actualBudget = require('../src/actualBudget');

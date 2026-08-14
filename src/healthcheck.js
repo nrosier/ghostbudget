@@ -2,14 +2,10 @@
 /**
  * Container health check.
  *
- * Replaces `node -e "process.exit(0)"`, which reported healthy no matter what was
- * happening — including the case the old design made likely, where `crond` had
- * died but `tail -f` kept PID 1 alive, so the container looked fine and never
- * synced again.
- *
- * Health here means "the scheduler is alive and still ticking", proven by a
- * heartbeat the scheduler refreshes on a timer. That checks the event loop is
- * running, not merely that a process exists.
+ * Health means "the scheduler is alive and still ticking", proven by a heartbeat the
+ * scheduler refreshes on a timer. That checks the event loop is running, not merely that
+ * a process exists — a container whose scheduler has died while PID 1 lives on looks
+ * fine and never syncs again. See docs/decisions.md.
  *
  * A failed *sync* deliberately does not make the container unhealthy. Syncs fail
  * for reasons outside this container — Actual Budget down, Ghostfolio

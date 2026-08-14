@@ -81,10 +81,9 @@ const logger = winston.createLogger({
     })(),
     winston.format.json()
   ),
-  // `version` used to be the literal '1.0.0', a second copy of package.json's that
-  // could not tell two builds of the same version apart. It now comes from
-  // package.json itself, alongside the commit the build was made from — see
-  // src/config/version.js for the format and why the build time is not here.
+  // Version and commit on every record, from package.json and the build stamp rather
+  // than a literal here — see src/config/version.js for the format and why the build
+  // time is not among them.
   defaultMeta: { service: 'ghostbudget', ...build.meta },
   transports: transports,
 });

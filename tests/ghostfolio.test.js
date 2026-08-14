@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+const { applyTestEnv } = require('./helpers/env');
+
 let configFixtureCount = 0;
 
 /**
@@ -50,25 +52,15 @@ describe('ghostfolio', () => {
     jest.resetModules();
     nock.cleanAll();
 
-    // Set up environment - add all required variables
-    process.env.GHOSTFOLIO_URL = baseUrl;
-    process.env.GHOSTFOLIO_TOKEN = accessToken;
-    process.env.ACTUAL_BUDGET_URL = 'http://localhost:5006';
-    process.env.ACTUAL_BUDGET_PASS = 'test-pass';
-    process.env.ACTUAL_BUDGET_SYNC_ID = 'test-sync-id';
-    process.env.ACTUAL_BUDGET_DATA_DIR = '/test/dir';
-    process.env.NODE_ENV = 'test';
+    applyTestEnv({ GHOSTFOLIO_URL: baseUrl, GHOSTFOLIO_TOKEN: accessToken });
 
-    // Import the module
-    ghostfolio = require('../src/ghostfolio');
+    // Constructed here rather than by the require: the client is what this suite is
+    // about, and a require with no side effect is what lets the missing-token case
+    // below assert on construction rather than on import order.
+    ghostfolio = require('../src/ghostfolio').getClient();
 
     // Directly set the configPath on the instance
     ghostfolio.configPath = path.join(__dirname, '..', 'config.json.example');
-
-    // Mock console methods
-    jest.spyOn(console, 'log').mockImplementation(() => {});
-    jest.spyOn(console, 'error').mockImplementation(() => {});
-    jest.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -443,10 +435,10 @@ describe('ghostfolio', () => {
     });
 
     it('resolves every mapping and sends no write when DRY_RUN is set', async () => {
-      process.env.DRY_RUN = 'true';
       try {
         jest.resetModules();
-        const dryRun = require('../src/ghostfolio');
+        applyTestEnv({ GHOSTFOLIO_URL: baseUrl, GHOSTFOLIO_TOKEN: accessToken, DRY_RUN: 'true' });
+        const dryRun = require('../src/ghostfolio').getClient();
         dryRun.configPath = path.join(__dirname, '..', 'config.json.example');
 
         stubAuthAndAccounts();
@@ -645,9 +637,13 @@ describe('ghostfolio', () => {
       // guarantee is the one README states: the process refuses to start rather
       // than starting with a configuration that cannot work.
       jest.resetModules();
-      delete process.env.GHOSTFOLIO_TOKEN;
+      applyTestEnv({ GHOSTFOLIO_TOKEN: undefined });
 
-      expect(() => require('../src/ghostfolio')).toThrow(/GHOSTFOLIO_TOKEN/);
+      // getClient(), not the require: constructing the client is what reads the
+      // environment now, and the require deliberately no longer has a side effect —
+      // it used to throw out of index.js's own import, before that file had
+      // installed the handler that would have logged it.
+      expect(() => require('../src/ghostfolio').getClient()).toThrow(/GHOSTFOLIO_TOKEN/);
     });
 
     it('sends the security token from the environment, not the auth token', async () => {

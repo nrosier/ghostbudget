@@ -2,7 +2,13 @@
 // the one place a non-Error rejection can destroy both the failure and the event
 // that records it. Everything below the orchestration is mocked out.
 jest.mock('../src/actualBudget', () => ({ getAccountBalances: jest.fn() }));
-jest.mock('../src/ghostfolio', () => ({ syncAccountBalances: jest.fn() }));
+// The client is constructed on demand rather than at require time, so what is mocked
+// is the accessor. One instance per factory run, so getClient() in index.js and
+// getClient() in a test are the same object — as they are in a real run.
+jest.mock('../src/ghostfolio', () => {
+  const client = { syncAccountBalances: jest.fn() };
+  return { getClient: () => client };
+});
 jest.mock('../src/utils/audit', () => ({
   logSync: jest.fn(),
   logAuth: jest.fn(),
@@ -19,8 +25,9 @@ const os = require('os');
 const path = require('path');
 
 const { getAccountBalances } = require('../src/actualBudget');
-const ghostfolio = require('../src/ghostfolio');
+const ghostfolio = require('../src/ghostfolio').getClient();
 const AuditLogger = require('../src/utils/audit');
+const { applyTestEnv } = require('./helpers/env');
 const { sync } = require('../src/index');
 
 /**
@@ -54,6 +61,9 @@ describe('sync', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // sync() validates the environment as its first step, so these cases need a
+    // valid one even though everything they exercise is mocked.
+    applyTestEnv();
   });
 
   it('fetches balances, forwards them, and audits a completed run', async () => {
@@ -163,12 +173,44 @@ describe('sync', () => {
     expect(syncEvent('failed')).toMatchObject({ error_type: 'auth_error' });
   });
 
-  it('classifies a network failure', async () => {
-    getAccountBalances.mockRejectedValue(new Error('network unreachable'));
+  it.each([['ECONNREFUSED'], ['ENOTFOUND'], ['ETIMEDOUT'], ['ERR_NETWORK']])(
+    'classifies a %s failure as a network error',
+    async (code) => {
+      // By `code`, which is where Node and axios put this. The previous test read
+      // `message.includes('network')` and passed an error saying 'network
+      // unreachable' — a message no failure in this application produces, so the
+      // arm it was testing could not be reached by a real run.
+      const failure = Object.assign(new Error(`connect ${code} 127.0.0.1:3333`), { code });
+      getAccountBalances.mockRejectedValue(failure);
 
-    await expect(sync()).rejects.toThrow(/network unreachable/);
+      await expect(sync()).rejects.toThrow(code);
 
-    expect(syncEvent('failed')).toMatchObject({ error_type: 'network_error' });
+      expect(syncEvent('failed')).toMatchObject({ error_type: 'network_error' });
+    }
+  );
+
+  it('classifies a capitalized authentication message', async () => {
+    // 'Invalid authentication response' is what the client actually throws; the
+    // match used to be case-sensitive against the lowercase word only.
+    getAccountBalances.mockRejectedValue(new Error('Authentication rejected by Ghostfolio'));
+
+    await expect(sync()).rejects.toThrow(/Authentication rejected/);
+
+    expect(syncEvent('failed')).toMatchObject({ error_type: 'auth_error' });
+  });
+
+  it('reports an invalid environment as a failed run, not a crash before startup', async () => {
+    // The environment used to be validated in the Ghostfolio client's constructor,
+    // which ran at require time — before index.js had installed its handlers. The
+    // process died with a raw stack trace and wrote nothing to either log file. It
+    // has to be a failure of the run, with an audit event and a flushed log.
+    applyTestEnv({ GHOSTFOLIO_TOKEN: undefined });
+
+    await expect(sync()).rejects.toThrow(/Invalid environment variables/);
+
+    expect(getAccountBalances).not.toHaveBeenCalled();
+    expect(AuditLogger.logSync).toHaveBeenCalledWith('started');
+    expect(syncEvent('failed')).toMatchObject({ error_type: 'unknown_error' });
   });
 
   it('survives a rejection that carries no message', async () => {

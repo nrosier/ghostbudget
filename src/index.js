@@ -2,9 +2,10 @@
 require('dotenv').config({ quiet: true });
 
 const { getAccountBalances } = require('./actualBudget');
-const ghostfolio = require('./ghostfolio');
+const { getClient } = require('./ghostfolio');
 const logger = require('./logger');
 const build = require('./config/version');
+const { getEnv } = require('./config/env');
 const AuditLogger = require('./utils/audit');
 const { flushLogsAndExit } = require('./utils/exit');
 const { errorMessageOf, sanitizeError } = require('./utils/validation');
@@ -15,15 +16,9 @@ let isShuttingDown = false;
 /**
  * Graceful shutdown handler.
  *
- * There is no cleanup step here, and the "add any cleanup logic here" placeholder
- * that used to stand in for one — wrapped in a try/catch around a single log call,
- * so the catch was unreachable — has gone with it. A sync owns nothing that this
- * handler could release more safely than process exit does: the Actual Budget
- * connection is closed by getAccountBalances before it returns, and an interrupted
- * one is inside a native better-sqlite3 call that will not unwind on request.
- *
- * What the handler has to get right is exiting exactly once, and flushing the log
- * before it does — both of which it still does.
+ * There is no cleanup step, deliberately: a sync owns nothing this handler could
+ * release more safely than process exit does — see docs/decisions.md. What it has to
+ * get right is exiting exactly once, and flushing the log before it does.
  *
  * @param {string} signal - Signal that triggered the shutdown
  */
@@ -54,12 +49,54 @@ process.on('uncaughtException', (error) => {
   flushLogsAndExit(1);
 });
 
+/**
+ * A failed connection reports itself as a `code`, not in its message: Node says
+ * `connect ECONNREFUSED 127.0.0.1:3333`, axios says `timeout of 30000ms exceeded`, and
+ * neither contains the word "network". See docs/decisions.md for what matching on the
+ * message cost the audit trail.
+ *
+ * These codes survive the trip because `authenticate()` and `getAccountBalances()`
+ * rethrow what they caught rather than wrapping it.
+ */
+const NETWORK_ERROR_CODES = new Set([
+  'EAI_AGAIN',
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'EPIPE',
+  'ERR_NETWORK',
+  'ETIMEDOUT',
+]);
+
+/**
+ * Categorize a failed run for the audit trail.
+ *
+ * @param {*} error - Whatever the sync rejected with, which need not be an Error
+ * @param {string} message - Its message, already read defensively
+ * @returns {string} 'network_error', 'auth_error' or 'unknown_error'
+ */
+function classifyError(error, message) {
+  if (NETWORK_ERROR_CODES.has(error?.code)) {
+    return 'network_error';
+  }
+
+  // Case-insensitive: the messages that describe this are 'Invalid authentication
+  // response' and 'Not authenticated', and one of them is capitalized.
+  if (/authenticat/i.test(message)) {
+    return 'auth_error';
+  }
+
+  return 'unknown_error';
+}
+
 async function sync() {
   const startTime = Date.now();
 
   // No `timestamp` on any of the records below: winston's own format.timestamp()
-  // already puts one on every record, so passing another only produced two fields
-  // that had to agree.
+  // already puts one on every record.
   try {
     // The build fields ride on the record this already wrote. Every other record
     // carries the version and commit from the logger's defaultMeta; this is the one
@@ -68,11 +105,18 @@ async function sync() {
     logger.info('Starting sync process...', build.startup);
     AuditLogger.logSync('started');
 
+    // Explicitly, and here. Every step below needs a valid environment, and the
+    // first of them would otherwise be the one to discover it — reporting a missing
+    // GHOSTFOLIO_TOKEN as an Actual Budget authentication failure. Inside the try is
+    // the part that matters: the handlers registered above are what turn this into a
+    // logged, flushed, audited failure instead of a stack trace on stderr.
+    getEnv();
+
     // Get balances from Actual Budget
     logger.info('Fetching balances from Actual Budget...');
     const balances = await getAccountBalances();
 
-    if (!balances || !Array.isArray(balances) || balances.length === 0) {
+    if (!Array.isArray(balances) || balances.length === 0) {
       throw new Error('No balances received from Actual Budget');
     }
 
@@ -80,15 +124,14 @@ async function sync() {
 
     // Sync balances to Ghostfolio
     logger.info('Syncing balances to Ghostfolio...');
-    const summary = await ghostfolio.syncAccountBalances(balances);
+    const summary = await getClient().syncAccountBalances(balances);
 
     const duration = Date.now() - startTime;
 
-    // The counts come from the sync, which is the only thing that knows them. This
-    // used to record `accounts_synced: balances.length` — the number of accounts in
-    // Actual Budget, so a budget with 20 accounts and two mappings audited a
-    // successful sync of 20. `accounts_in_budget` is that number under a name that
-    // is true of it.
+    // The counts come from the sync, which is the only thing that knows them.
+    // `accounts_in_budget` is deliberately not one of them: it is how many accounts
+    // Actual Budget has, which is neither how many were mapped nor how many were
+    // written. See docs/decisions.md.
     const outcome = {
       duration_ms: duration,
       accounts_in_budget: balances.length,
@@ -106,11 +149,7 @@ async function sync() {
     // Read the message defensively: a non-Error rejection here would otherwise
     // throw a TypeError from inside this catch block and lose the audit event.
     const message = errorMessageOf(error);
-    const errorType = message.includes('authentication')
-      ? 'auth_error'
-      : message.includes('network')
-        ? 'network_error'
-        : 'unknown_error';
+    const errorType = classifyError(error, message);
 
     // `error.summary` is set when the sync ran and some accounts failed, so a
     // partial run records how many balances it did store. Absent for a failure

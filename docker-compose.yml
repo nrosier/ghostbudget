@@ -1,9 +1,11 @@
 services:
   ghostbudget:
-    # Pinned to a released tag, not :latest. With :latest, `docker compose up -d`
-    # or any container restart silently rolls out whatever was published most
-    # recently — including a build nobody reviewed.
-    image: niqck/ghostbudget:1.0.0
+    # CI publishes `:latest` and `:<commit-sha>`, and nothing else — no version tags
+    # exist to point at (see docs/decisions.md). To pin, and a restart otherwise rolls
+    # out whatever was published most recently, use the commit tag that is really there:
+    # `image: niqck/ghostbudget:<sha>`, the full 40-character SHA of the commit you mean.
+    # `docker inspect` reports it as org.opencontainers.image.revision.
+    image: niqck/ghostbudget:latest
     container_name: ghostbudget
     restart: unless-stopped
 
@@ -45,10 +47,8 @@ services:
 
     environment:
       - CRON_TASK=${CRON_TASK:-0 5 * * *}
-      # Pinned to the volume mount below so the two cannot drift. .env.example
-      # previously suggested a placeholder path, and the old entrypoint skipped its
-      # directory check silently when that path did not exist — Actual Budget then
-      # wrote to a location that was not persisted, and every run started over.
+      # Pinned to the volume mount above so the two cannot drift: a data directory that
+      # is not the persisted one means every run starts over. See docs/decisions.md.
       - ACTUAL_BUDGET_DATA_DIR=/actual-budget
 
 volumes:

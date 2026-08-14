@@ -1,6 +1,8 @@
 module.exports = {
   testEnvironment: 'node',
-  clearMocks: true,
+  // No `clearMocks`: `resetMocks` subsumes it. `restoreMocks` is the one that matters
+  // for jest.spyOn — it puts the original method back, which is why the console spies in
+  // jest.setup.js are installed from a hook. See docs/decisions.md.
   resetMocks: true,
   restoreMocks: true,
   moduleDirectories: ['node_modules', 'src'],

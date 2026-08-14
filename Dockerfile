@@ -27,31 +27,20 @@ COPY package*.json ./
 
 # Install dependencies, denying install scripts by default.
 #
-# package.json used to carry an `allowScripts` block — @lavamoat/allow-scripts
-# configuration for a package that was never installed, so it named three
-# permitted packages while every dependency in the tree ran its install scripts
-# unimpeded. `--ignore-scripts` is the control that block described: arbitrary
-# code from any transitive dependency is refused at install time, and the one
-# package that genuinely needs to compile is then built by name.
+# `--ignore-scripts` refuses arbitrary code from any transitive dependency at install
+# time, and the one package that genuinely needs to compile is then built by name:
+# better-sqlite3 (via @actual-app/api) is a native module with no prebuilt binary for
+# Alpine's musl, so `npm rebuild` compiles it here against the virtual build-deps, which
+# are removed in the same layer.
 #
-# better-sqlite3 (via @actual-app/api) is a native module with no prebuilt binary
-# for Alpine's musl, so `npm rebuild` compiles it here against the virtual
-# build-deps, which are removed in the same layer.
+# The package managers are then deleted, in this same layer so the bytes never enter the
+# image at all — the same reasoning as .build-deps above. They accounted for every
+# fixable CRITICAL/HIGH Trivy finding in the image and nothing here needs them at
+# runtime: the entrypoint is node, the healthcheck is node, and the scheduler forks
+# process.execPath. See docs/decisions.md for why a base-image bump does not do it.
 #
-# The package managers are then deleted, in this same layer so the bytes never
-# enter the image at all — the same reasoning as .build-deps above. Trivy scans
-# the whole filesystem, and the npm that ships in node:lts-alpine vendors its own
-# dependency tree: tar, brace-expansion, ip-address and undici there accounted
-# for every fixable CRITICAL/HIGH finding in this image, while the application's
-# own production tree was clean. Updating the base image does not fix it, because
-# the digest above is already the current node:lts-alpine, and `apk upgrade`
-# cannot touch npm, which is not an apk package.
-#
-# Nothing here needs them at runtime: the entrypoint is node, the healthcheck is
-# node, and the scheduler forks process.execPath. Removing them also drops yarn
-# and corepack, so a future CVE in either cannot fail the build for code that is
-# never executed. Use the /opt/yarn-* glob: a base image bundling a different
-# yarn patch version would otherwise leave yarn behind silently.
+# Use the /opt/yarn-* glob: a base image bundling a different yarn patch version would
+# otherwise leave yarn behind silently.
 #
 # To run a sync by hand in the container: docker exec <name> node src/index.js
 RUN npm ci --omit=dev --ignore-scripts && \
@@ -64,9 +53,9 @@ RUN npm ci --omit=dev --ignore-scripts && \
            /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg \
            /root/.npm
 
-# Application code is copied root-owned, so it is read-only to the account the
-# sync runs as. Previously this was `COPY --chown=nodejs:nodejs . .`, which let a
-# compromised sync or a malicious dependency rewrite src/ and persist across runs.
+# Application code is copied root-owned, so it is read-only to the account the sync runs
+# as: a compromised sync or a malicious dependency cannot rewrite src/ and persist across
+# runs. See docs/decisions.md.
 COPY . .
 
 # Only the paths the application must write to belong to nodejs:

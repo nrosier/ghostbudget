@@ -19,11 +19,10 @@ const MAX_RETRY_DELAY_MS = 8000;
 /**
  * Directory for Winston's file transports.
  *
- * Anchored to the application root rather than left relative: `logs/combined.log`
- * resolves against the *working directory*, so it only worked because the old
- * crontab entry did `cd /app` first. Any other caller — a systemd unit with a
- * different WorkingDirectory, a developer running the sync from a subdirectory —
- * silently scattered log files or lost them entirely.
+ * Anchored to the application root rather than left relative: a relative
+ * `logs/combined.log` resolves against the *working directory*, so a systemd unit with
+ * a different WorkingDirectory, or a developer running the sync from a subdirectory,
+ * silently scattered log files or lost them entirely. See docs/decisions.md.
  *
  * @returns {string} Absolute path to the log directory
  */
@@ -87,14 +86,10 @@ module.exports = {
 
   // TLS Configuration
   //
-  // The version floor is the control that matters, and it is deliberately not
-  // paired with a cipher allowlist. The previous list permitted only ECDHE-RSA
-  // suites for TLS 1.2, which fails the handshake outright against a server
-  // holding an ECDSA certificate — Let's Encrypt ECDSA and Cloudflare both issue
-  // them — and its TLS 1.3 entries were inert, because Node's `ciphers` option
-  // governs TLS 1.2 and below only (TLS 1.3 needs `ciphersuites`, which Node does
-  // not expose). Node's default suite list is already modern and drops the weak
-  // suites, so pinning bought nothing and broke real deployments.
+  // The version floor is the control that matters, and it is deliberately not paired
+  // with a cipher allowlist: Node's `ciphers` option governs TLS 1.2 and below only, and
+  // its default suite list is already modern. A hand-written list broke handshakes
+  // against ECDSA certificates and bought nothing — see docs/decisions.md.
   TLS_MIN_VERSION: 'TLSv1.2',
   TLS_MAX_VERSION: 'TLSv1.3',
 
@@ -116,10 +111,9 @@ module.exports = {
   // closer than half a cent are the same stored value. Used to decide whether a
   // write would change anything, and to check what the server echoed back.
   BALANCE_EPSILON: 0.005,
-  // These are named like strength controls, so they have to behave like them: at
-  // 1 they only rejected the empty string, and `ACTUAL_BUDGET_PASS=x` validated
-  // happily. A Ghostfolio access token is a generated UUID (36 characters), so
-  // the token floor rejects typos and truncated copy-pastes without rejecting any
+  // Named like strength controls, so they have to behave like them — see
+  // docs/decisions.md. A Ghostfolio access token is a generated UUID (36 characters),
+  // so the token floor rejects typos and truncated copy-pastes without rejecting any
   // real token.
   MIN_PASSWORD_LENGTH: 8,
   MIN_TOKEN_LENGTH: 16,

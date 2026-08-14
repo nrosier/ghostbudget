@@ -410,6 +410,30 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ accounts: [withoutCurrency] })).toThrow(/ISO 4217/);
   });
 
+  it('reports one repeated failure once, with a count and the paths that have it', () => {
+    // `abortEarly: false` reports every failure, and a config written against an
+    // earlier version fails the same way on every mapping: six accounts with no
+    // `currency` meant six verbatim copies of one 230-character explanation in a
+    // single log line and a single error message. The count and the paths are the
+    // only part that differs between them, so they are the only part kept.
+    const withoutCurrency = (ghostfolioName) => ({
+      ghostfolioName,
+      actualBudgetName: 'B',
+    });
+
+    let message = '';
+    try {
+      validateConfig({
+        accounts: [withoutCurrency('A'), withoutCurrency('B'), withoutCurrency('C')],
+      });
+    } catch (error) {
+      message = error.message;
+    }
+
+    expect(message).toContain('[3: accounts.0.currency, accounts.1.currency, accounts.2.currency]');
+    expect(message.match(/ISO 4217/g)).toHaveLength(1);
+  });
+
   it('normalizes a currency and rejects one that is not an ISO 4217 code', () => {
     expect(
       validateConfig({ accounts: [mapping({ currency: ' eur ' })] }).accounts[0].currency

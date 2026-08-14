@@ -7,13 +7,10 @@
  * place rather than spelled out at thirty call sites — and the level routing, which
  * decides whether an event reaches logs/error.log at all.
  *
- * Each payload used to also carry `timestamp: new Date().toISOString()` and an
- * `event_id` UUID. The timestamp duplicated the one winston's own
- * `format.timestamp()` already puts on every record, and the id was a second
- * identifier alongside the per-process `correlationId` from logger.js, with nothing
- * consuming it: there is no separate audit sink, and no query that needs to address
- * one event rather than one run. Both are gone; `uuid` left the dependency list
- * with them.
+ * No payload carries its own `timestamp` or event id. winston's `format.timestamp()`
+ * already puts one on every record, and the per-process `correlationId` from logger.js
+ * is the identifier a run is addressed by — there is no separate audit sink, and no
+ * query that needs to address one event rather than one run. See docs/decisions.md.
  */
 
 const logger = require('../logger');

@@ -5,8 +5,8 @@ require('./config/tls');
 const api = require('@actual-app/api');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
+const { getEnv } = require('./config/env');
 const {
-  validateEnvironment,
   validateBalance,
   validateAccountName,
   errorMessageOf,
@@ -20,8 +20,7 @@ async function getAccountBalances() {
   let opened = false;
 
   try {
-    // Validate environment variables
-    const env = validateEnvironment(process.env);
+    const env = getEnv();
 
     logger.debug('Initializing Actual Budget API...');
 
@@ -50,14 +49,9 @@ async function getAccountBalances() {
 
     logger.info(`Found ${accounts.length} accounts`);
 
-    // Get balances for all accounts with validation.
-    //
-    // This used to run in BATCH_SIZE-sized slices, described as preventing memory
-    // issues with large account lists. It did neither thing: @actual-app/api reads
-    // balances out of a local better-sqlite3 database, whose calls are synchronous,
-    // so Promise.all never overlapped any work and the slices never bounded
-    // anything — every balance ended up in the same array either way. What was
-    // left was a loop, an environment variable, and a log line per batch.
+    // Every balance in one pass, validated as it is read. @actual-app/api reads them
+    // out of a local better-sqlite3 database and its calls are synchronous, so batching
+    // this bounds nothing — see docs/decisions.md for the BATCH_SIZE that tried.
     logger.debug('Fetching account balances...');
     const balances = await Promise.all(
       accounts.map(async (account) => ({
@@ -66,13 +60,9 @@ async function getAccountBalances() {
       }))
     );
 
-    // Account names are logged; balance values are not, in any environment.
-    // This used to be gated on NODE_ENV !== 'production', which meant every
-    // balance was written to logs/combined.log on a developer machine and in any
-    // deployment that had not set NODE_ENV — while SECURITY.md stated flatly that
-    // logs do not contain balances. The gate is gone rather than the claim: a log
-    // file is the wrong place for account values regardless of environment, and it
-    // outlives the process on a mounted volume.
+    // Account names are logged; balance values are not, in any environment. A log file
+    // outlives the process on a mounted volume, so there is no NODE_ENV under which it
+    // is the right place for them — see docs/decisions.md for the gate there used to be.
     logger.info(`Successfully fetched balances for ${balances.length} accounts`);
     logger.debug('Fetched accounts', { accounts: balances.map((account) => account.name) });
 
@@ -96,11 +86,9 @@ async function getAccountBalances() {
     // Re-throw to allow caller to handle
     throw error;
   } finally {
-    // The shutdown call used to be the last statement of the try block, so every
-    // path that threw after init() — a failed budget download, a rejected balance,
-    // an account name that did not validate — left the server connection and the
-    // local SQLite handle open until the process exited. Under the scheduler that
-    // process is a fork whose exit is not instant.
+    // In `finally`, so no path that throws after init() leaves the server connection
+    // and the local SQLite handle open — under the scheduler this process is a fork
+    // whose exit is not instant. See docs/decisions.md.
     if (opened) {
       try {
         await api.shutdown();

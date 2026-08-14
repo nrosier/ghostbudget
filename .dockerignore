@@ -20,10 +20,10 @@ tests/
 *.swo
 *~
 
-# Documentation
-README.md
-SECURITY_AUDIT_REPORT.md
+# Documentation. `*.md` matches the repository root only — a single `*` does not
+# cross a `/` — so docs/ needs its own entry or the whole tree lands in the image.
 *.md
+docs/
 
 # Configuration examples (not actual configs)
 .env.example

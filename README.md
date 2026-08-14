@@ -15,7 +15,8 @@ GhostBudget is a Node.js application that synchronizes account balances between 
 
 ## Prerequisites
 
-- Node.js (v14 or higher recommended)
+- Node.js 18 or newer, and npm 9 or newer (enforced by `engines` in
+  [package.json](package.json))
 - An Actual Budget server instance
 - A Ghostfolio instance
 - Access tokens/credentials for both services
@@ -34,7 +35,7 @@ The script will:
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/johnkrzywanek/ghostbudget.git
+git clone https://github.com/nrosier/ghostbudget.git
 cd ghostbudget
 ```
 
@@ -142,7 +143,9 @@ The `config.json` file maps accounts between Actual Budget and Ghostfolio. Examp
 
 > **Upgrading**: `currency` was previously absent. An existing `config.json`
 > without it will fail validation at startup, before anything is written — add the
-> code each mapped Ghostfolio account is denominated in.
+> code each mapped Ghostfolio account is denominated in. `CACHE_TTL_MINUTES` and
+> `BATCH_SIZE` in an older `.env` need no attention: unknown variables are allowed,
+> so a leftover setting is ignored rather than fatal.
 >
 > **Mapping a brokerage account**: a Ghostfolio account's `balance` is its **cash**
 > balance; the account's total value is that cash _plus_ its holdings. Writing a
@@ -377,6 +380,33 @@ volume.
 
 ## Development
 
+### Project structure
+
+```text
+src/
+├── scheduler.js          # Long-running container entry: cron, forks one sync per run
+├── index.js              # Sync entry point: orchestrates sync, shutdown, error handling
+├── actualBudget.js       # Fetches account balances from Actual Budget
+├── ghostfolio.js         # Ghostfolio API client: auth, account matching, balance PUTs
+├── healthcheck.js        # Container HEALTHCHECK probe
+├── logger.js             # Winston logger with correlation IDs
+├── config/
+│   ├── constants.js      # Centralized configuration constants
+│   ├── env.js            # The validated environment, read once per process
+│   ├── tls.js            # Process-wide TLS version floor
+│   └── version.js        # Build identity: version, commit, build time
+└── utils/
+    ├── audit.js          # Security audit logging
+    ├── exit.js           # Flush log transports before exiting
+    └── validation.js     # Joi-based config/env/input validation
+
+tests/                    # One suite per module above, plus scheduler supervision
+```
+
+`src/index.js` runs a single `sync()` and exits — there is no long-running server and
+no HTTP endpoint. `src/scheduler.js` is the container's long-lived process and forks
+`index.js` once per scheduled run.
+
 ### Checks
 
 ```bash
@@ -440,6 +470,17 @@ Common issues and solutions:
      the confirming request failed, or an account was no longer in the list. The
      values were most likely stored; they are simply unverified. If it persists, the
      account list is the thing to look at.
+
+## Further reading
+
+- [SECURITY.md](SECURITY.md) — the security posture of record: what each control is,
+  the reporting process, and the deployment checklist.
+- [docs/decisions.md](docs/decisions.md) — why the code has the shape it has, in the
+  cases where that shape came from removing or replacing something that did not work.
+  Worth reading before changing a guard, a validator, or the container's scheduler:
+  each entry records what the previous shape cost.
+- [docs/history/](docs/history/) — the archived audit that produced most of the
+  hardening. Point-in-time records, not current documentation.
 
 ## License
 
