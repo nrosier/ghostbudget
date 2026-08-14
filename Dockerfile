@@ -25,11 +25,20 @@ WORKDIR /app
 
 COPY package*.json ./
 
-# Install dependencies with security best practices
-# - npm ci for reproducible builds
-# - omit dev dependencies
-# - clean cache to reduce image size
-RUN npm ci --omit=dev && \
+# Install dependencies, denying install scripts by default.
+#
+# package.json used to carry an `allowScripts` block — @lavamoat/allow-scripts
+# configuration for a package that was never installed, so it named three
+# permitted packages while every dependency in the tree ran its install scripts
+# unimpeded. `--ignore-scripts` is the control that block described: arbitrary
+# code from any transitive dependency is refused at install time, and the one
+# package that genuinely needs to compile is then built by name.
+#
+# better-sqlite3 (via @actual-app/api) is a native module with no prebuilt binary
+# for Alpine's musl, so `npm rebuild` compiles it here against the virtual
+# build-deps, which are removed in the same layer.
+RUN npm ci --omit=dev --ignore-scripts && \
+    npm rebuild better-sqlite3 && \
     npm cache clean --force && \
     apk del .build-deps
 

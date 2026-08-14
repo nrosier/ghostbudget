@@ -24,16 +24,19 @@ jobs:
           node-version: '22'
           cache: 'npm'
       
+      # --ignore-scripts matches the Dockerfile: dependency install scripts are
+      # arbitrary code, and CI runs with a token. better-sqlite3 is not rebuilt
+      # here because nothing in this job loads it.
       - name: Install dependencies
-        run: npm ci
-      
+        run: npm ci --ignore-scripts
+
       - name: Run npm audit
         run: npm audit --audit-level=moderate
         continue-on-error: true
-      
+
       - name: Run npm audit (production only)
-        run: npm audit --production --audit-level=high
-      
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Check for outdated packages
         run: npm outdated || true
 
@@ -66,8 +69,11 @@ jobs:
           cache: 'npm'
       
       - name: Install dependencies
-        run: npm ci
-      
+        run: npm ci --ignore-scripts
+
+      # eslint-plugin-security is registered in eslint.config.js, and `npm run lint`
+      # runs with --max-warnings=0. Before both changes this step ran none of the
+      # plugin's rules and could not have failed on one if it had.
       - name: Run ESLint with security plugin
         run: npm run lint
 
@@ -81,20 +87,36 @@ jobs:
       
       - name: Build Docker image
         run: docker build -t ghostbudget:test .
-      
+
+      # Two Trivy steps, because one cannot do both jobs. The SARIF step must not
+      # fail, or a finding would abort the workflow before the results are uploaded
+      # and the Security tab would stay empty precisely when it matters. The gate
+      # then runs from Trivy's local cache and is the step that fails the build.
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: 'ghostbudget:test'
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
-      
+
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
+
+      # ignore-unfixed: a CVE with no available patch cannot be actioned by this
+      # repository, and blocking every build on one trains people to ignore the job.
+      # Anything fixable at CRITICAL or HIGH fails here.
+      - name: Fail on fixable CRITICAL/HIGH vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: 'ghostbudget:test'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
 
   secret-scanning:
     name: Secret Scanning
@@ -107,7 +129,7 @@ jobs:
           fetch-depth: 0
       
       - name: TruffleHog OSS
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
         with:
           path: ./
           base: ''

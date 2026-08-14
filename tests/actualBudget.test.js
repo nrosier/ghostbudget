@@ -22,7 +22,9 @@ describe('actualBudget', () => {
     process.env.ACTUAL_BUDGET_SYNC_ID = 'test-sync-id';
     process.env.ACTUAL_BUDGET_DATA_DIR = '/test/dir';
     process.env.GHOSTFOLIO_URL = 'http://localhost:3333';
-    process.env.GHOSTFOLIO_TOKEN = 'test-token';
+    // A UUID, because that is the shape of a Ghostfolio anonymous-user token and
+    // validateEnvironment enforces a 16-character minimum.
+    process.env.GHOSTFOLIO_TOKEN = '0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9';
 
     // Import the module in each test to get a fresh instance
     actualBudget = require('../src/actualBudget');

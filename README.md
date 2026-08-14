@@ -1,6 +1,6 @@
 # GhostBudget
 
-GhostBudget is a Node.js application that synchronizes account balances between [Actual Budget](https://github.com/actualbudget/actual) and [Ghostfolio](https://github.com/ghostfolio/ghostfolio). It automatically fetches your account balances from Actual Budget and updates the corresponding accounts in Ghostfolio. Big thanks to authors and contributors from both projects! 
+GhostBudget is a Node.js application that synchronizes account balances between [Actual Budget](https://github.com/actualbudget/actual) and [Ghostfolio](https://github.com/ghostfolio/ghostfolio). It automatically fetches your account balances from Actual Budget and updates the corresponding accounts in Ghostfolio. Big thanks to authors and contributors from both projects!
 
 ## Features
 
@@ -18,6 +18,7 @@ GhostBudget is a Node.js application that synchronizes account balances between 
 - Access tokens/credentials for both services
 
 The script will:
+
 1. Fetch account balances from Actual Budget
 2. Authenticate with Ghostfolio
 3. Get the current account list from Ghostfolio
@@ -27,17 +28,25 @@ The script will:
 ## Installation
 
 1. Clone the repository:
+
 ```bash
 git clone https://github.com/johnkrzywanek/ghostbudget.git
 cd ghostbudget
 ```
 
 2. Install dependencies:
+
 ```bash
-npm install
+npm run install:ci
 ```
 
+Dependency install scripts are denied by default and `better-sqlite3` is then
+rebuilt by name, because `@actual-app/api` loads it natively. A plain
+`npm install` works but runs the install scripts of every package in the tree;
+`npm run install:prod` does the same as `install:ci` without dev dependencies.
+
 3. Create configuration files:
+
 ```bash
 cp .env.example .env
 cp config.json.example config.json
@@ -50,14 +59,25 @@ cp config.json.example config.json
 
 ### Environment Variables (.env)
 
-- `ACTUAL_BUDGET_URL`: URL of your Actual Budget server
-- `ACTUAL_BUDGET_PASS`: Your Actual Budget server password
+All of these are validated at startup, and the process refuses to run rather than
+starting with a configuration that cannot work.
+
+- `ACTUAL_BUDGET_URL`: URL of your Actual Budget server. Must be `https://` when
+  `NODE_ENV=production`.
+- `ACTUAL_BUDGET_PASS`: Your Actual Budget server password. **Minimum 8
+  characters** — enough to reject an empty or placeholder value.
 - `ACTUAL_BUDGET_SYNC_ID`: Your budget's sync ID
 - `ACTUAL_BUDGET_DATA_DIR`: Directory for Actual Budget data. Must be an absolute
   path to an existing, writable directory; the container sets this to the
   `/actual-budget` volume mount.
-- `GHOSTFOLIO_URL`: URL of your Ghostfolio instance
-- `GHOSTFOLIO_TOKEN`: Your Ghostfolio access token
+- `GHOSTFOLIO_URL`: URL of your Ghostfolio instance. Must be `https://` when
+  `NODE_ENV=production`.
+- `GHOSTFOLIO_TOKEN`: The anonymous-user security token from Ghostfolio, which is
+  a UUID. **Minimum 16 characters**, which catches a truncated or half-pasted
+  token before it becomes a run of failed authentications.
+- `GHOSTBUDGET_LOG_DIR` (optional): Where to write log files. Defaults to
+  `<app root>/logs`, resolved absolutely rather than against the working
+  directory. Set this if the app root is not writable.
 - `CRON_TASK`: Schedule for the container's built-in scheduler (Docker only).
   A five-field cron expression such as `0 5 * * *`, or one of `@hourly`,
   `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`.
@@ -107,10 +127,18 @@ LOG_LEVEL=error npm run sync
 
 ### Log Files
 
-Logs are written to:
-- `logs/combined.log`: Contains all logs
-- `logs/error.log`: Contains only error logs
+Logs are written to `GHOSTBUDGET_LOG_DIR`, or to `<app root>/logs` if it is not
+set. The path is absolute either way, so running the sync from a subdirectory or
+under a service manager with a different working directory still puts the logs in
+one place.
+
+- `combined.log`: Contains all logs
+- `error.log`: Contains only error logs
 - Console: Shows colored output for development
+
+Both files rotate at 10 MB, keeping 5 generations. Log files never contain
+passwords, access tokens, account balances, or stack traces — in any environment.
+They do contain account names, which are treated as non-sensitive identifiers.
 
 ## Automated Execution
 
@@ -187,21 +215,23 @@ WantedBy=timers.target
 ```
 
 Enable and start the timer:
+
 ```bash
 sudo systemctl enable ghostbudget-sync.timer
 sudo systemctl start ghostbudget-sync.timer
 ```
 
-
 ### Balance Conversion
 
 The application automatically handles balance conversion between the two systems:
+
 - Actual Budget stores balances as integers (e.g., 100012 for $1,000.12)
 - GhostBudget converts these to decimal format before sending to Ghostfolio (e.g., 1000.12)
 
 ## Error Handling
 
 The application includes comprehensive error handling:
+
 - Validates required environment variables
 - Verifies account mappings exist in both systems
 - Provides detailed error messages for troubleshooting
@@ -209,13 +239,30 @@ The application includes comprehensive error handling:
 
 ## Development
 
+### Checks
+
+```bash
+npm run lint            # ESLint, including eslint-plugin-security; warnings fail
+npm run lint:fix        # …and fix what can be fixed automatically
+npm run format          # Prettier
+npm test                # Jest
+npm run test:coverage   # Jest with the coverage thresholds enforced
+```
+
+CI runs `npm run test:coverage` rather than `npm test`, because Jest's coverage
+thresholds only engage when coverage is collected. If you add a module, expect the
+thresholds in [jest.config.js](jest.config.js) to hold you to covering it.
+
+`npm run lint` uses `--max-warnings=0`. `eslint-plugin-security` reports at warning
+level, so without that flag its findings print and the build passes anyway.
 
 ### Adding New Features
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Submit a pull request
+4. Run `npm run lint` and `npm run test:coverage`
+5. Submit a pull request
 
 ## Troubleshooting
 

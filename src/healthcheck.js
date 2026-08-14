@@ -72,12 +72,22 @@ function evaluateHealth(raw, now = Date.now()) {
  */
 function readState(file) {
   try {
+    // The path comes from constants.healthStateFile(), not from a request or a file.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
     return fs.readFileSync(file, 'utf8');
   } catch {
     return null;
   }
 }
 
+/**
+ * Entry point: read the state file, print a one-line summary, set the exit code.
+ *
+ * Docker reads only the exit status, so that is the contract under test; the
+ * summary exists for `docker inspect` and for a human reading the probe output.
+ *
+ * @returns {void}
+ */
 function main() {
   const file = constants.healthStateFile();
   const verdict = evaluateHealth(readState(file));
@@ -102,4 +112,7 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { evaluateHealth };
+// readState and main are exported for the tests: the verdict logic is worth
+// asserting on its own, but so is the wiring around it — a health check that
+// evaluates correctly and then exits 0 regardless is the bug this file replaced.
+module.exports = { evaluateHealth, readState, main };

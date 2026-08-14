@@ -1,8 +1,8 @@
 # Security Policy & Audit Report — GhostBudget
 
-**Last Updated:** 2026-07-31
+**Last Updated:** 2026-08-13
 **Application Version:** 1.0.0
-**Audit Version:** 3.0
+**Audit Version:** 3.1
 **Overall Risk Level:** 🟢 **LOW**
 
 ---
@@ -22,13 +22,13 @@ breaker, audit logging, correlation IDs) are now implemented and verified in
 code. The application is considered **production-ready** from a security
 standpoint.
 
-| Risk area                 | Status  |
-| ------------------------- | ------- |
-| Credential exposure       | 🟢 LOW  |
-| Injection                 | 🟢 LOW  |
-| Container security         | 🟢 LOW  |
-| Transport security         | 🟢 LOW  |
-| Operational security       | 🟢 LOW  |
+| Risk area            | Status |
+| -------------------- | ------ |
+| Credential exposure  | 🟢 LOW |
+| Injection            | 🟢 LOW |
+| Container security   | 🟢 LOW |
+| Transport security   | 🟢 LOW |
+| Operational security | 🟢 LOW |
 
 ---
 
@@ -68,12 +68,24 @@ repository to stay informed.
   [src/utils/validation.js](src/utils/validation.js).
 - URL scheme/host validation plus an **HTTPS requirement in production** for
   both `ACTUAL_BUDGET_URL` and `GHOSTFOLIO_URL`
-  ([src/utils/validation.js:87-94](src/utils/validation.js#L87-L94)).
-- Balance, account-name, and API-response validation
-  (`validateBalance`, `validateAccountName`, `validateApiResponse`).
+  ([src/utils/validation.js](src/utils/validation.js)).
+- **Credential length minimums** are enforced at startup, so a placeholder or an
+  empty-ish value fails fast instead of becoming a live credential:
+  `ACTUAL_BUDGET_PASS` at least 8 characters, `GHOSTFOLIO_TOKEN` at least 16
+  ([src/config/constants.js:137-138](src/config/constants.js#L137-L138)). The
+  Ghostfolio token is a UUID in practice, so 16 is a floor that catches
+  truncation and copy-paste errors rather than a policy for humans to satisfy.
+- Balance, factor, account-name, and API-response validation
+  (`validateBalance`, `validateFactor`, `validateAccountName`,
+  `validateApiResponse`). `validateFactor` is separate from `validateBalance` on
+  purpose: a factor of `0` is falsy and finite, so a single "is this a usable
+  number" check accepted it and silently zeroed every balance it touched.
+- Money is converted in minor units — `Math.round(cents * factor) / 100` — so a
+  factor cannot produce a float artefact that reaches a financial API. Multiplying
+  in units instead sent values like `1100.1320000000001` to be stored as a balance.
 - Defense-in-depth rejection of obviously malicious account names
   (`<script`, `javascript:`, `on*=`) at
-  [src/utils/validation.js:135-143](src/utils/validation.js#L135-L143). Account
+  [src/utils/validation.js:198-206](src/utils/validation.js#L198-L206). Account
   names are treated as identifiers and serialized as JSON only — they are
   intentionally **not** HTML-escaped, so legitimate names containing
   `& < > " '` still match across both APIs. A rejected name emits an
@@ -83,13 +95,25 @@ repository to stay informed.
 
 - Structured JSON logging via Winston with a per-process correlation ID
   ([src/logger.js](src/logger.js)); file transports rotate at 10 MB / 5 files.
-- `sanitizeError()` strips stack traces and other potentially sensitive fields
-  before anything is logged
-  ([src/utils/validation.js:153-160](src/utils/validation.js#L153-L160)).
-- Balance values are not logged (debug logging deliberately omits them —
-  [src/ghostfolio.js:206-209](src/ghostfolio.js#L206-L209)).
+  Log paths are absolute, anchored to the application root (or
+  `GHOSTBUDGET_LOG_DIR`), and the directory is created `0750` at startup — a
+  relative `logs/` path silently depended on the process's working directory.
+- `sanitizeError()` strips stack traces, **redacts credentials that reached an
+  error message**, and caps the message at 512 characters
+  ([src/utils/validation.js](src/utils/validation.js)). Redaction is both
+  value-based — the live values of `ACTUAL_BUDGET_PASS` and `GHOSTFOLIO_TOKEN` are
+  replaced wherever they appear — and pattern-based, covering `Bearer` tokens,
+  `token=`/`password=` query and form parameters, and credentials embedded in a
+  URL's userinfo. A remote server that echoes a request back, or an error string
+  built by concatenating a URL, would otherwise put a secret in the log file.
+- **Balance values are never logged**, in any environment. This was previously
+  conditional on `NODE_ENV`, which meant every non-production run wrote account
+  balances to disk in plain text.
 - Graceful shutdown on `SIGTERM`/`SIGINT` plus handlers for unhandled
-  rejections and uncaught exceptions ([src/index.js](src/index.js)).
+  rejections and uncaught exceptions ([src/index.js](src/index.js)). Exit waits
+  for Winston's transports to flush, so the failure reason and the audit event
+  that records it survive the exit
+  ([src/utils/exit.js](src/utils/exit.js)).
 
 ### Audit trail ✅
 
@@ -97,25 +121,46 @@ repository to stay informed.
   balance updates, sync start/complete/fail, security events (e.g.
   circuit-breaker open, XSS attempt), and validation failures — each stamped
   with a unique `event_id` and ISO timestamp.
+- Balance-update events record **whether the balance actually changed**, compared
+  against the value Ghostfolio already held. This was a hardcoded `true` for every
+  account on every run, which made the audit trail useless for the one question it
+  exists to answer: what did this job change?
 
 ### Transport security ✅
 
 - Certificate validation enforced (`rejectUnauthorized: true`).
-- TLS 1.2 minimum / TLS 1.3 maximum with a pinned cipher suite and
-  `honorCipherOrder` ([src/ghostfolio.js:44-56](src/ghostfolio.js#L44-L56)).
+- TLS 1.2 minimum / TLS 1.3 maximum on the Ghostfolio agent
+  ([src/ghostfolio.js](src/ghostfolio.js)).
+- **A process-wide TLS floor** (`tls.DEFAULT_MIN_VERSION`) set by
+  [src/config/tls.js](src/config/tls.js), which both service modules load. The
+  agent options only cover the Ghostfolio leg: `@actual-app/api` opens its own
+  connections, which no agent option of ours reaches, so the Actual Budget leg was
+  previously free to negotiate TLS 1.0.
+- **No cipher allowlist.** There was one, and it was worse than nothing: it
+  permitted only `ECDHE-RSA` suites for TLS 1.2, which fails the handshake outright
+  against a server holding an ECDSA certificate — what Let's Encrypt and Cloudflare
+  both issue by default. Its TLS 1.3 entries were inert regardless, because Node's
+  `ciphers` option governs TLS 1.2 and below only. Node's default suite list is
+  maintained upstream and is the better choice here.
 - 30 s request timeout and 10 MB content/body size limits to bound resource use
   ([src/config/constants.js](src/config/constants.js)).
 
 ### Resilience & abuse protection ✅
 
 - **Rate limiting:** `rate-limiter-flexible` throttles outbound calls to 10
-  req/s ([src/ghostfolio.js:34-37](src/ghostfolio.js#L34-L37)).
-- **Circuit breaker:** `opossum` opens at a 50% error rate (30 s timeout / 30 s
-  reset) and logs a high-severity audit event on open
-  ([src/ghostfolio.js:76-95](src/ghostfolio.js#L76-L95)).
+  req/s ([src/ghostfolio.js](src/ghostfolio.js)).
+- **Circuit breaker:** `opossum` opens at a 50% error rate and logs a
+  high-severity audit event on open ([src/ghostfolio.js](src/ghostfolio.js)). Its
+  timeout is derived from the retry budget rather than fixed, so the breaker cannot
+  trip on a request that is still legitimately retrying underneath it.
 - **Retry with exponential backoff:** `axios-retry` retries network/idempotent
-  errors and HTTP 429 up to `MAX_RETRIES` (default 3)
-  ([src/ghostfolio.js:59-73](src/ghostfolio.js#L59-L73)).
+  errors and HTTP 429 up to `MAX_RETRIES` (default 3), with each delay capped at
+  `MAX_RETRY_DELAY_MS` ([src/ghostfolio.js](src/ghostfolio.js)).
+- **Account updates are a bounded projection.** The update payload is built from
+  the fields Ghostfolio's `UpdateAccountDto` accepts, not by spreading the fetched
+  account. Ghostfolio's validation pipe runs with `forbidNonWhitelisted: true`, so a
+  single extra property fails the whole request with a 400; the previous hand-built
+  payload also omitted fields, and a `PUT` that omits a field resets it.
 
 ### Secrets management ✅
 
@@ -127,6 +172,8 @@ repository to stay informed.
 - `.env` and `config*.json` are excluded from the Docker build context
   ([.dockerignore](.dockerignore)), so a local `docker build` cannot bake real
   credentials into an image layer.
+- Credentials that reach an error message are redacted before logging — see
+  **Secure logging & error handling** above.
 
 ### Container security ✅
 
@@ -142,8 +189,15 @@ repository to stay informed.
   root-owned; only `/app/logs` and the data directory belong to `nodejs`, and the
   container root filesystem is mounted `read_only` with a small tmpfs at `/tmp`.
   A compromised sync cannot rewrite `src/` and persist across runs.
-- Build toolchain removed after native-module compilation; `npm ci --omit=dev`
-  for reproducible, production-only installs.
+- Build toolchain removed after native-module compilation.
+- **Dependency install scripts are denied by default.** Installs run
+  `npm ci --ignore-scripts`, and `better-sqlite3` is then rebuilt _by name_
+  because `@actual-app/api` loads it natively. This applies to the image build, to
+  CI, and to the `install:ci` / `install:prod` scripts in
+  [package.json](package.json). Previously an `allowScripts` field named three
+  permitted packages while every dependency in the tree ran its install scripts
+  unimpeded: the field belongs to `@lavamoat/allow-scripts`, which was not
+  installed, so nothing read it.
 - `tini` is PID 1, so `SIGTERM` from `docker stop` is forwarded to the scheduler,
   which stops scheduling, gives an in-flight sync 8 s to finish, and exits.
 - `CRON_TASK` is parsed by `croner` and constrained to a five-field expression or
@@ -167,29 +221,48 @@ repository to stay informed.
 Defined in [.github/workflows/security.yml](.github/workflows/security.yml),
 running on push, pull request, and a daily schedule:
 
-- `npm audit` (moderate) and a blocking production `npm audit` (high).
+- `npm audit` (moderate, advisory) plus a **blocking** `npm audit --omit=dev
+--audit-level=high`. The `--omit=dev` matters: a dev-only advisory previously
+  failed the production gate, which is the kind of noise that gets a gate disabled.
 - Dependency review on pull requests (`fail-on-severity: moderate`).
-- ESLint with `eslint-plugin-security`.
-- Trivy container image scan (CRITICAL/HIGH) with results uploaded to GitHub
-  Security.
+- **ESLint with `eslint-plugin-security` actually registered.** The plugin was a
+  dependency and appeared in this document, but it was never added to
+  [eslint.config.js](eslint.config.js), so none of its 14 rules ran. `npm run lint`
+  now also uses `--max-warnings=0`, so a finding fails the build rather than
+  scrolling past.
+- **Trivy image scan that can fail the build.** Results are uploaded to GitHub
+  Security (unconditionally, via `if: always()`), and a second Trivy step then
+  gates on fixable CRITICAL/HIGH findings (`exit-code: 1`, `ignore-unfixed: true`).
+  The scan step itself must not be the gate, or a failing scan skips its own SARIF
+  upload and the finding never reaches the Security tab.
+- **Images are scanned before they are pushed.**
+  [docker-image.yml](.github/workflows/docker-image.yml) builds with `load: true,
+push: false`, scans the loaded image, and only then logs in to the registry and
+  pushes. Registry login is deliberately deferred until after all third-party code
+  has run.
+- All third-party actions are **pinned to a commit SHA**, not a moving tag.
 - TruffleHog secret scanning.
+- Test coverage thresholds are enforced in CI
+  ([jest.config.js](jest.config.js), [test.yml](.github/workflows/test.yml)). The
+  CI job runs `npm run test:coverage` rather than `npm test`, because Jest's
+  thresholds only engage when coverage is collected.
 
 ---
 
 ## OWASP Top 10 (2021) Assessment
 
-| Category                                   | Status | Notes                                                             |
-| ------------------------------------------ | ------ | ----------------------------------------------------------------- |
-| A01 Broken Access Control                  | ✅ PASS | Minimal access model; no multi-user surface.                      |
-| A02 Cryptographic Failures                 | ✅ PASS | Secrets kept out of disk/logs; HTTPS + cert validation enforced.  |
-| A03 Injection                              | ✅ PASS | Joi validation on all inputs; cron expression validated.          |
-| A04 Insecure Design                        | ✅ PASS | Rate limiting, circuit breaker, and audit trail in place.         |
-| A05 Security Misconfiguration              | ✅ PASS | Secure defaults; non-root execution; HTTPS forced in production.  |
-| A06 Vulnerable & Outdated Components        | ✅ PASS | Dependencies current; `npm audit` reports 0 vulnerabilities.      |
-| A07 Identification & Authentication Failures | 🟡 PARTIAL | Token auth with audit logging; no token expiry/refresh (see below). |
-| A08 Software & Data Integrity Failures      | 🟡 PARTIAL | No SBOM or image signing; base image pinned by tag, not digest.   |
-| A09 Security Logging & Monitoring Failures  | ✅ PASS | Structured, sanitized logs with correlation IDs and audit events. |
-| A10 Server-Side Request Forgery (SSRF)      | ✅ PASS | URL scheme/host validation; HTTPS enforced in production.         |
+| Category                                     | Status     | Notes                                                                                                                |
+| -------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------- |
+| A01 Broken Access Control                    | ✅ PASS    | Minimal access model; no multi-user surface.                                                                         |
+| A02 Cryptographic Failures                   | ✅ PASS    | Secrets kept out of disk/logs; HTTPS + cert validation enforced.                                                     |
+| A03 Injection                                | ✅ PASS    | Joi validation on all inputs; cron expression validated.                                                             |
+| A04 Insecure Design                          | ✅ PASS    | Rate limiting, circuit breaker, and audit trail in place.                                                            |
+| A05 Security Misconfiguration                | ✅ PASS    | Secure defaults; non-root execution; HTTPS forced in production.                                                     |
+| A06 Vulnerable & Outdated Components         | ✅ PASS    | Dependencies current; `npm audit` reports 0 vulnerabilities; blocking high-severity gate in CI.                      |
+| A07 Identification & Authentication Failures | 🟡 PARTIAL | Token auth with audit logging and length minimums; no token expiry/refresh (see below).                              |
+| A08 Software & Data Integrity Failures       | 🟡 PARTIAL | Base image pinned by digest; actions pinned by SHA; install scripts denied by default. No SBOM or image signing yet. |
+| A09 Security Logging & Monitoring Failures   | ✅ PASS    | Structured, sanitized logs with correlation IDs and audit events.                                                    |
+| A10 Server-Side Request Forgery (SSRF)       | ✅ PASS    | URL scheme/host validation; HTTPS enforced in production.                                                            |
 
 **Score: 8 / 10 PASS** (2 partial, no failures).
 
@@ -200,17 +273,17 @@ running on push, pull request, and a daily schedule:
 `npm audit` reports **0 known vulnerabilities**. Production dependencies are
 kept current (managed via Dependabot):
 
-| Package                 | Version   |
-| ----------------------- | --------- |
-| `@actual-app/api`       | ^26.7.0   |
-| `axios`                 | 1.19.0    |
-| `axios-retry`           | ^4.5.0    |
-| `dotenv`                | 17.4.2    |
-| `joi`                   | 18.2.3    |
-| `opossum`               | ^10.0.0   |
-| `rate-limiter-flexible` | ^11.2.0   |
-| `uuid`                  | ^14.0.1   |
-| `winston`               | 3.19.0    |
+| Package                 | Version |
+| ----------------------- | ------- |
+| `@actual-app/api`       | ^26.7.0 |
+| `axios`                 | 1.19.0  |
+| `axios-retry`           | ^4.5.0  |
+| `dotenv`                | 17.4.2  |
+| `joi`                   | 18.2.3  |
+| `opossum`               | ^10.0.0 |
+| `rate-limiter-flexible` | ^11.2.0 |
+| `uuid`                  | ^14.0.1 |
+| `winston`               | 3.19.0  |
 
 ---
 
@@ -247,7 +320,15 @@ against the built image, which is what surfaces the need to update.
 
 Logs **may** contain account names (treated as non-sensitive identifiers), sync
 status, errors, and API endpoint URLs. Logs **do not** contain passwords,
-access tokens, account balances, or stack traces.
+access tokens, account balances, or stack traces — and this holds in every
+environment, not only when `NODE_ENV=production`.
+
+Credential redaction in `sanitizeError()` is defence in depth, not a licence to
+put secrets in messages. It removes the known secret values and the common
+patterns that carry them; a credential the application never learned the value of
+(a third-party token echoed back inside a JSON error body, say) is not something
+value-based redaction can find. Treat log files as sensitive and restrict access
+to them accordingly.
 
 ---
 
@@ -260,7 +341,11 @@ access tokens, account balances, or stack traces.
 3. **Enhanced monitoring** — metrics/alerting on repeated auth failures and
    suspicious activity; optional syslog/HTTP log transport.
 4. **Expanded security testing** — integration/fuzz tests and SAST (e.g. Snyk,
-   SonarQube) in addition to the current ESLint + `npm audit` + Trivy pipeline.
+   SonarQube) in addition to the current ESLint + `eslint-plugin-security` +
+   `npm audit` + Trivy pipeline.
+5. **Egress restriction** — the container can currently reach any host. A network
+   policy limiting egress to the two configured API hosts is listed in the
+   deployment checklist below but is not something the image can enforce itself.
 
 None of these are blocking; they can be delivered post-launch without material
 security risk.
@@ -278,7 +363,12 @@ rest are the operator's responsibility.
 - ✅ The base image is pinned to a `sha256` digest, not a tag.
 - ✅ Resource limits (CPU, memory) are configured.
 - ✅ The health check verifies the scheduler is actually running.
+- ✅ Dependency install scripts are denied by default at image build time.
+- ✅ A minimum TLS version is enforced process-wide, covering both API legs.
 - [ ] Secrets are stored in a secret manager, not committed `.env` files.
+- [ ] `ACTUAL_BUDGET_PASS` and `GHOSTFOLIO_TOKEN` are real credentials, not
+      placeholders — the 8- and 16-character minimums catch empty and truncated
+      values, not weak ones.
 - [ ] HTTPS is enforced for both API endpoints (required in production).
 - [ ] The published image tag in `docker-compose.yml` is the one you intend to
       run (it is pinned to a release, not `latest` — bump it deliberately).

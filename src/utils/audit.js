@@ -46,14 +46,22 @@ class AuditLogger {
    * @param {Object} details - Additional details
    */
   static logSync(status, details = {}) {
-    const logLevel = status === 'failed' ? 'error' : 'info';
-    logger[logLevel]('Sync operation', {
+    const payload = {
       event: 'sync',
       event_id: uuidv4(),
       status,
       timestamp: new Date().toISOString(),
       ...details,
-    });
+    };
+
+    // Branching rather than logger[level](): a computed method name on an object
+    // is the pattern that turns a tainted string into an arbitrary call, and
+    // there is no reason to spend that risk on two fixed levels.
+    if (status === 'failed') {
+      logger.error('Sync operation', payload);
+    } else {
+      logger.info('Sync operation', payload);
+    }
   }
 
   /**
@@ -63,15 +71,20 @@ class AuditLogger {
    * @param {Object} details - Additional details
    */
   static logSecurityEvent(eventType, severity, details = {}) {
-    const logLevel = severity === 'critical' || severity === 'high' ? 'error' : 'warn';
-    logger[logLevel]('Security event', {
+    const payload = {
       event: 'security',
       event_id: uuidv4(),
       event_type: eventType,
       severity,
       timestamp: new Date().toISOString(),
       ...details,
-    });
+    };
+
+    if (severity === 'critical' || severity === 'high') {
+      logger.error('Security event', payload);
+    } else {
+      logger.warn('Security event', payload);
+    }
   }
 
   /**

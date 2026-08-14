@@ -26,7 +26,7 @@
  */
 
 // Load environment variables first
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -154,7 +154,11 @@ function writeState() {
   const temp = `${file}.${process.pid}.tmp`;
 
   try {
+    // Both paths derive from constants.healthStateFile() and process.pid, never from
+    // external input.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
     fs.writeFileSync(temp, JSON.stringify(state), { mode: 0o600 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
     fs.renameSync(temp, file);
   } catch (error) {
     // A missing health file makes the container unhealthy, which is the correct
@@ -412,4 +416,48 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { normalizeSchedule, CRON_NICKNAMES };
+// The supervision logic below normalizeSchedule is the part that decides whether a
+// wedged sync gets killed, whether two runs can overlap on the same SQLite file,
+// and whether `docker stop` is honoured. Those are the behaviours worth testing, so
+// they are reachable; `state` is exported read-only-by-convention for assertions.
+module.exports = {
+  normalizeSchedule,
+  CRON_NICKNAMES,
+  writeState,
+  runSync,
+  onTick,
+  shutdown,
+  main,
+  state,
+  /**
+   * Reset module-level state between tests.
+   *
+   * @returns {void}
+   */
+  __resetForTests() {
+    Object.assign(state, {
+      schedule: null,
+      startedAt: null,
+      heartbeatAt: null,
+      nextRunAt: null,
+      running: false,
+      runStartedAt: null,
+      lastRunFinishedAt: null,
+      lastRunOutcome: null,
+      lastRunExitCode: null,
+      lastRunDurationMs: null,
+      runCount: 0,
+      failureCount: 0,
+    });
+    if (job) {
+      job.stop();
+    }
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
+    job = null;
+    heartbeat = null;
+    child = null;
+    isShuttingDown = false;
+  },
+};

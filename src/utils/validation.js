@@ -69,7 +69,9 @@ const envSchema = Joi.object({
   GHOSTFOLIO_TOKEN: Joi.string().min(constants.MIN_TOKEN_LENGTH).required(),
   LOG_LEVEL: Joi.string().valid('error', 'warn', 'info', 'debug').default('info'),
   NODE_ENV: Joi.string().valid('development', 'production', 'test').default('production'),
-  CACHE_TTL_MINUTES: Joi.number().integer().min(1).max(60).default(5),
+  // CACHE_TTL_MINUTES is gone: the cache it configured never served a read in a
+  // one-shot process. Unknown variables are allowed, so an operator who still has
+  // it set in a .env file sees no error — it simply does nothing, as before.
   BATCH_SIZE: Joi.number().integer().min(1).max(50).default(10),
   MAX_RETRIES: Joi.number().integer().min(0).max(10).default(3),
 }).unknown(true); // Allow other env vars
@@ -140,6 +142,35 @@ function validateBalance(balance) {
     throw new Error(`Invalid balance: must be a finite number, got ${typeof balance}`);
   }
   return balance;
+}
+
+/**
+ * Validate a per-account multiplication factor.
+ *
+ * Distinct from validateBalance for a reason: a balance may legitimately be
+ * negative or zero, a factor may not. Reusing the balance validator here meant
+ * `factor: 0` (every balance silently becomes 0) and `factor: -1` (every sign
+ * flipped) passed validation on the public `updateAccountBalance` path. The Joi
+ * config schema already enforces `positive()`, so the gap only affected direct
+ * callers — which is exactly the boundary a public method has to defend.
+ *
+ * @param {*} factor - Factor value to validate
+ * @returns {number} Validated factor
+ * @throws {Error} If validation fails
+ */
+function validateFactor(factor) {
+  if (typeof factor !== 'number' || !Number.isFinite(factor)) {
+    throw new Error(`Invalid factor: must be a finite number, got ${typeof factor}`);
+  }
+  if (factor <= 0) {
+    throw new Error(`Invalid factor: must be greater than zero, got ${factor}`);
+  }
+  if (factor > constants.MAX_BALANCE_FACTOR) {
+    throw new Error(
+      `Invalid factor: must not exceed ${constants.MAX_BALANCE_FACTOR}, got ${factor}`
+    );
+  }
+  return factor;
 }
 
 /**
@@ -215,6 +246,9 @@ function validateDataDir(dir) {
 
   let stats;
   try {
+    // Inspecting an operator-supplied path is this function's entire purpose, and the
+    // path is checked here rather than opened.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
     stats = fs.statSync(resolved);
   } catch {
     throw new Error(
@@ -242,6 +276,75 @@ function validateDataDir(dir) {
 }
 
 /**
+ * Environment variables whose values must never reach a log line.
+ */
+const SECRET_ENV_VARS = ['ACTUAL_BUDGET_PASS', 'GHOSTFOLIO_TOKEN'];
+
+/**
+ * Patterns for credential-shaped text, for the cases the exact-value pass cannot
+ * catch: a token minted by the remote (the Ghostfolio `authToken` is issued at
+ * runtime and is in no environment variable), or a secret embedded in a URL that
+ * axios helpfully included in its error message.
+ *
+ * Each entry keeps its leading label and replaces only the value, so a redacted
+ * message still says *what* was suppressed.
+ */
+const SECRET_PATTERNS = [
+  // Authorization: Bearer <token>, and the header as axios renders it
+  [/(bearer\s+)[\w\-._~+/]+=*/gi, '$1[REDACTED]'],
+  // "accessToken":"…", authToken=…, "password": "…", apiKey: …
+  [
+    /(["']?(?:access[_-]?token|auth[_-]?token|refresh[_-]?token|password|passwd|secret|api[_-]?key|token)["']?\s*[:=]\s*["']?)[^"'\s,&}]+/gi,
+    '$1[REDACTED]',
+  ],
+  // https://user:password@host
+  [/(:\/\/[^:/?#\s]+:)[^@/?#\s]+@/g, '$1[REDACTED]@'],
+];
+
+/**
+ * Remove credential-shaped text from a string and bound its length.
+ *
+ * sanitizeError already withheld stack traces, but it passed `error.message`
+ * through verbatim — and a message is not a safe field. axios embeds the request
+ * URL and, on some failures, the request configuration; `@actual-app/api` can
+ * embed a server response. Anything that lands in an error message lands in
+ * logs/combined.log, which is mounted on a volume and read by whoever debugs the
+ * container.
+ *
+ * @param {*} text - Candidate text
+ * @param {number} [maxLength] - Maximum length of the result
+ * @returns {string} Redacted, length-bounded text
+ */
+function redactSecrets(text, maxLength = constants.MAX_ERROR_MESSAGE_LENGTH) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return '';
+  }
+
+  let result = text;
+
+  // Exact known secret values first: a password can be any shape at all, so
+  // matching it literally is the only reliable pass. Very short values are
+  // skipped — replacing every "a" in a message would destroy it without
+  // protecting anything, and such a value fails validateEnvironment anyway.
+  const secrets = Object.entries(process.env).filter(([name]) => SECRET_ENV_VARS.includes(name));
+  for (const [name, value] of secrets) {
+    if (typeof value === 'string' && value.length >= 6) {
+      result = result.split(value).join(`[REDACTED:${name}]`);
+    }
+  }
+
+  for (const [pattern, replacement] of SECRET_PATTERNS) {
+    result = result.replace(pattern, replacement);
+  }
+
+  if (result.length > maxLength) {
+    result = `${result.slice(0, maxLength)}… [truncated ${result.length - maxLength} chars]`;
+  }
+
+  return result;
+}
+
+/**
  * Read a message from a thrown or rejected value of unknown shape.
  *
  * Not every rejection carries an Error: libraries reject with plain objects, and
@@ -250,18 +353,24 @@ function validateDataDir(dir) {
  * from inside the catch block, destroying the original failure and the audit
  * event that was about to be written. Always route through this helper.
  *
+ * The result is redacted and length-bounded, so every existing call site is safe
+ * to log without remembering to sanitize it. Callers use the result for keyword
+ * classification too ('authentication', 'network'); those keywords are never
+ * redacted, though a message long enough to be truncated could in principle lose
+ * one that appears past the cap.
+ *
  * @param {*} value - Thrown or rejected value
- * @returns {string} A message string, never undefined
+ * @returns {string} A redacted message string, never undefined
  */
 function errorMessageOf(value) {
   if (value instanceof Error) {
-    return value.message;
+    return redactSecrets(value.message);
   }
   if (typeof value === 'string') {
-    return value;
+    return redactSecrets(value);
   }
   if (value !== null && typeof value === 'object' && typeof value.message === 'string') {
-    return value.message;
+    return redactSecrets(value.message);
   }
   return `Non-error rejection of type ${value === null ? 'null' : typeof value}`;
 }
@@ -274,10 +383,13 @@ function errorMessageOf(value) {
 function sanitizeError(error) {
   if (error instanceof Error) {
     return {
-      message: error.message,
+      message: redactSecrets(error.message),
       code: error.code,
       name: error.name,
-      // Explicitly exclude stack trace and other potentially sensitive data
+      // Explicitly exclude stack trace and other potentially sensitive data.
+      // axios attaches `config` (headers, including Authorization) and `request`
+      // to its errors; naming the fields we keep means those can never be picked
+      // up by a future change here.
     };
   }
 
@@ -315,9 +427,11 @@ module.exports = {
   validateConfig,
   validateEnvironment,
   validateBalance,
+  validateFactor,
   validateAccountName,
   validateDataDir,
   errorMessageOf,
+  redactSecrets,
   sanitizeError,
   validateApiResponse,
 };

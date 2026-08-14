@@ -1,3 +1,6 @@
+// Pin the TLS floor process-wide before any client is constructed.
+require('./config/tls');
+
 const axios = require('axios');
 const axiosRetry = require('axios-retry').default;
 const https = require('https');
@@ -12,10 +15,39 @@ const {
   validateConfig,
   validateEnvironment,
   validateBalance,
+  validateFactor,
   validateAccountName,
+  errorMessageOf,
   sanitizeError,
   validateApiResponse,
 } = require('./utils/validation');
+
+/**
+ * The fields Ghostfolio's `UpdateAccountDto` accepts, besides `balance`.
+ *
+ * The account PUT used to hand-build its payload from seven fixed fields, which
+ * meant any field the account model gained was sent absent — and on a PUT that is
+ * a reset, not a no-op. The obvious fix is to spread the fetched account, but that
+ * breaks against the live API: Ghostfolio's NestJS validation pipe runs with
+ * `forbidNonWhitelisted: true`, so a single property outside the DTO fails the
+ * whole request with a 400. The GET response carries plenty of them — computed
+ * values, the expanded platform, tag objects.
+ *
+ * So the fetched account is projected onto the DTO's own field set instead:
+ * nothing is invented, nothing outside the contract is sent, and a field added to
+ * the DTO is one entry away from being carried through.
+ *
+ * `tags` is deliberately excluded. It is in the DTO, but the GET returns tag
+ * *objects* while the DTO expects an array of ids, and Ghostfolio's update
+ * implements tags as delete-all-then-create — so sending them back would either
+ * fail validation or destroy the account's tags. Omitting the property leaves the
+ * existing associations untouched.
+ *
+ * Verified against ghostfolio/ghostfolio@main:
+ * libs/common/src/lib/dtos/update-account.dto.ts, apps/api/src/main.ts,
+ * apps/api/src/app/account/account.service.ts.
+ */
+const UPDATABLE_ACCOUNT_FIELDS = ['comment', 'currency', 'id', 'name'];
 
 class GhostfolioAPI {
   constructor() {
@@ -24,11 +56,6 @@ class GhostfolioAPI {
     this.baseURL = env.GHOSTFOLIO_URL.replace(/\/$/, '');
     this.accessToken = null;
     this.configPath = path.join(__dirname, '..', 'config.json');
-
-    // Cache configuration
-    this.accountsCache = null;
-    this.accountsCacheExpiry = null;
-    this.cacheTTL = (env.CACHE_TTL_MINUTES || 5) * 60 * 1000;
 
     this.maxRetries = env.MAX_RETRIES ?? constants.MAX_RETRIES;
 
@@ -51,10 +78,10 @@ class GhostfolioAPI {
       maxBodyLength: constants.MAX_BODY_LENGTH_BYTES,
       httpsAgent: new https.Agent({
         rejectUnauthorized: true,
+        // Version floor only — see the TLS note in config/constants.js for why the
+        // cipher allowlist was removed rather than extended.
         minVersion: constants.TLS_MIN_VERSION,
         maxVersion: constants.TLS_MAX_VERSION,
-        ciphers: constants.TLS_CIPHERS,
-        honorCipherOrder: true,
         keepAlive: true,
         keepAliveMsecs: 30000,
         maxSockets: 50,
@@ -156,7 +183,7 @@ class GhostfolioAPI {
       AuditLogger.logAuth(true, { service: 'ghostfolio' });
     } catch (error) {
       logger.error('Failed to authenticate with Ghostfolio', sanitizeError(error));
-      AuditLogger.logAuth(false, { service: 'ghostfolio', error: error.message });
+      AuditLogger.logAuth(false, { service: 'ghostfolio', error: errorMessageOf(error) });
       throw error;
     }
   }
@@ -166,13 +193,10 @@ class GhostfolioAPI {
       throw new Error('Not authenticated. Call authenticate() first');
     }
 
-    // Check cache first
-    const now = Date.now();
-    if (this.accountsCache && this.accountsCacheExpiry > now) {
-      logger.debug('Using cached Ghostfolio accounts');
-      return this.accountsCache;
-    }
-
+    // There is no cache here any more. One was maintained with a configurable TTL
+    // and then invalidated after every balance update — in a process that fetches
+    // the account list exactly once and exits, so it never served a single read.
+    // CACHE_TTL_MINUTES could not have any effect whatever it was set to.
     try {
       logger.debug('Fetching Ghostfolio accounts...');
 
@@ -191,10 +215,6 @@ class GhostfolioAPI {
         throw new Error('Invalid API response: accounts must be an array');
       }
 
-      // Cache the results
-      this.accountsCache = response.data.accounts;
-      this.accountsCacheExpiry = now + this.cacheTTL;
-
       logger.info(`Found ${response.data.accounts.length} Ghostfolio accounts`);
       return response.data.accounts;
     } catch (error) {
@@ -212,23 +232,36 @@ class GhostfolioAPI {
       // Validate inputs
       validateAccountName(ghostfolioAccount.name);
       const validatedBalance = validateBalance(actualBudgetBalance);
-      const validatedFactor = validateBalance(factor);
+      const validatedFactor = validateFactor(factor);
 
-      const newBalance = (validatedBalance * validatedFactor) / 100;
+      // Round in minor units before dividing. Actual Budget stores balances as
+      // integer cents, but a factor need not be an integer, and float arithmetic
+      // on the way out produced values like 1100.1320000000001 from
+      // 100012 * 1.1 / 100 — sent verbatim to a financial API and stored as the
+      // account's balance.
+      const newBalance = Math.round(validatedBalance * validatedFactor) / 100;
+
+      // The previous balance is only used to decide whether this write changes
+      // anything. It is compared, never logged.
+      const previousBalance = Number(ghostfolioAccount.balance);
+      const changed = !Number.isFinite(previousBalance) || previousBalance !== newBalance;
 
       logger.debug('Updating account balance', {
         account: ghostfolioAccount.name,
-        // Don't log actual balance values in production
+        changed,
+        // Balance values are deliberately absent
       });
 
       const updateData = {
+        ...Object.fromEntries(
+          Object.entries(ghostfolioAccount).filter(([field]) =>
+            UPDATABLE_ACCOUNT_FIELDS.includes(field)
+          )
+        ),
         balance: newBalance,
-        comment: ghostfolioAccount.comment || '',
-        currency: ghostfolioAccount.currency,
-        id: ghostfolioAccount.id,
-        isExcluded: ghostfolioAccount.isExcluded || false,
-        name: ghostfolioAccount.name,
-        platformId: ghostfolioAccount.platformId || null,
+        // `platformId` is the one field the DTO requires to be *present* while
+        // allowing null, so an account with no platform still has to send it.
+        platformId: ghostfolioAccount.platformId ?? null,
       };
 
       const response = await this._apiRequest({
@@ -242,13 +275,12 @@ class GhostfolioAPI {
       });
 
       logger.info(`Successfully updated balance for account ${ghostfolioAccount.name}`);
-      AuditLogger.logBalanceUpdate(ghostfolioAccount.name, true, {
+      // `changed` is computed, not hardcoded. It used to be passed as a literal
+      // `true`, so the audit trail recorded a balance change for every account on
+      // every run and could not distinguish a real movement from a no-op write.
+      AuditLogger.logBalanceUpdate(ghostfolioAccount.name, changed, {
         service: 'ghostfolio',
       });
-
-      // Invalidate cache after update
-      this.accountsCache = null;
-      this.accountsCacheExpiry = null;
 
       return response.data;
     } catch (error) {
@@ -269,11 +301,13 @@ class GhostfolioAPI {
     // Read and validate config
     let configData;
     try {
+      // configPath is set in the constructor from __dirname; it is not derived from input.
+      // eslint-disable-next-line security/detect-non-literal-fs-filename
       const configContent = fs.readFileSync(this.configPath, 'utf8');
       configData = JSON.parse(configContent);
     } catch (error) {
       logger.error('Failed to read or parse config file', sanitizeError(error));
-      throw new Error(`Config file error: ${error.message}`);
+      throw new Error(`Config file error: ${errorMessageOf(error)}`);
     }
 
     const config = validateConfig(configData);
@@ -298,13 +332,17 @@ class GhostfolioAPI {
           throw new Error(`No matching Ghostfolio account found for ${ghostfolioAccountName}`);
         }
 
-        // config validation guarantees factor is a positive number (default 1)
-        const factor = validateBalance(mapping.factor);
+        // The Joi config schema already applies `positive()` with a default of 1;
+        // validateFactor is the same rule enforced at the point of use, so the
+        // guarantee does not depend on which path the value arrived by.
+        const factor = validateFactor(mapping.factor);
 
         await this.updateAccountBalance(ghostfolioAccount, actualAccount.balance, factor);
       } catch (error) {
         logger.error('Account sync failed', sanitizeError(error));
-        errors.push(error.message);
+        // Redacted and non-Error-safe: these messages are joined into the thrown
+        // summary below, which is itself logged and audited.
+        errors.push(errorMessageOf(error));
       }
     }
 

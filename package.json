@@ -11,9 +11,11 @@
     "test": "NODE_ENV=test jest",
     "test:watch": "NODE_ENV=test jest --watch",
     "test:coverage": "NODE_ENV=test jest --coverage",
-    "lint": "eslint . --ext .js",
+    "lint": "eslint . --ext .js --max-warnings=0",
     "lint:fix": "eslint . --ext .js --fix",
-    "format": "prettier --write \"**/*.{js,json,md}\""
+    "format": "prettier --write \"**/*.{js,json,md}\"",
+    "install:ci": "npm ci --ignore-scripts && npm rebuild better-sqlite3",
+    "install:prod": "npm ci --omit=dev --ignore-scripts && npm rebuild better-sqlite3"
   },
   "author": "",
   "license": "ISC",
@@ -47,10 +49,5 @@
   },
   "overrides": {
     "adm-zip": "^0.6.0"
-  },
-  "allowScripts": {
-    "better-sqlite3@12.11.1": true,
-    "fsevents@2.3.3": true,
-    "unrs-resolver@1.12.2": true
   }
 }

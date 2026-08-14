@@ -21,7 +21,7 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run linting
         run: npm run lint
@@ -39,8 +39,13 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
+      # See package.json: install scripts are denied by default, and better-sqlite3
+      # is then built by name because @actual-app/api loads it natively.
       - name: Install dependencies
-        run: npm ci
+        run: npm run install:ci
 
-      - name: Run tests
-        run: npm test
+      # Coverage rather than a bare `npm test`, because the thresholds in
+      # jest.config.js only engage when coverage is collected. Without this the
+      # gate exists in configuration and never runs anywhere.
+      - name: Run tests with coverage thresholds
+        run: npm run test:coverage

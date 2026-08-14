@@ -1,3 +1,7 @@
+// Pin the TLS floor before any connection is opened. @actual-app/api builds its
+// own HTTP client, so this is the only thing that covers this leg of the egress.
+require('./config/tls');
+
 const api = require('@actual-app/api');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
@@ -69,17 +73,15 @@ async function getAccountBalances() {
       balances.push(...batchBalances);
     }
 
-    // Log the results (without sensitive balance details in production)
-    if (env.NODE_ENV !== 'production') {
-      logger.info('Account Balances:', {
-        balances: balances.map((account) => ({
-          name: account.name,
-          balance: `$${account.balance.toFixed(2)}`,
-        })),
-      });
-    } else {
-      logger.info(`Successfully fetched balances for ${balances.length} accounts`);
-    }
+    // Account names are logged; balance values are not, in any environment.
+    // This used to be gated on NODE_ENV !== 'production', which meant every
+    // balance was written to logs/combined.log on a developer machine and in any
+    // deployment that had not set NODE_ENV — while SECURITY.md stated flatly that
+    // logs do not contain balances. The gate is gone rather than the claim: a log
+    // file is the wrong place for account values regardless of environment, and it
+    // outlives the process on a mounted volume.
+    logger.info(`Successfully fetched balances for ${balances.length} accounts`);
+    logger.debug('Fetched accounts', { accounts: balances.map((account) => account.name) });
 
     // Close the connection
     await api.shutdown();
