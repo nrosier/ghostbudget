@@ -100,6 +100,22 @@ module.exports = {
 
   // Validation Configuration
   MAX_ACCOUNT_NAME_LENGTH: 255,
+  // Ghostfolio account ids are generated identifiers (UUID/cuid shaped). The value
+  // is interpolated into the request path, so it is bounded and character-checked
+  // rather than trusted because it came from the server.
+  MAX_ACCOUNT_ID_LENGTH: 64,
+  // Upper bound on a balance in minor units, i.e. ten billion in major units.
+  //
+  // No realistic personal account reaches this, and a value that does is a
+  // corrupted read rather than a balance: Actual Budget stores minor units as
+  // integers, so a misread field or a units mix-up shows up as an absurd
+  // magnitude. Bounding it here means such a value fails the *fetch*, before any
+  // of it reaches Ghostfolio.
+  MAX_BALANCE_MINOR_UNITS: 1e12,
+  // Balances are compared in major units after rounding to cents, so two values
+  // closer than half a cent are the same stored value. Used to decide whether a
+  // write would change anything, and to check what the server echoed back.
+  BALANCE_EPSILON: 0.005,
   // These are named like strength controls, so they have to behave like them: at
   // 1 they only rejected the empty string, and `ACTUAL_BUDGET_PASS=x` validated
   // happily. A Ghostfolio access token is a generated UUID (36 characters), so

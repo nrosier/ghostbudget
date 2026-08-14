@@ -23,7 +23,7 @@ module.exports = {
   coverageThreshold: {
     global: {
       statements: 96,
-      branches: 91,
+      branches: 92,
       // 91.89 is the ceiling, not a gap to close: the shortfall is index.js's
       // `require.main === module` block, whose two callbacks cannot run in a module
       // a test has required. Reaching them means spawning a subprocess.
@@ -32,7 +32,9 @@ module.exports = {
     },
     './src/utils/validation.js': {
       statements: 100,
-      branches: 97,
+      // 99.1 is the ceiling: the remaining branch is the `process.getuid` fallback in
+      // validateDataDir, which only has a second arm on Windows.
+      branches: 99,
       functions: 100,
       lines: 100,
     },
@@ -48,13 +50,14 @@ module.exports = {
       functions: 100,
       lines: 100,
     },
-    // The remaining gaps here are axios-retry's backoff paths, which need a real
-    // clock to reach. Raise these to whatever the suite currently achieves.
+    // The remaining gaps here are axios-retry's `retryDelay` and `onRetry`
+    // callbacks, which need a real clock to reach — which is also why `functions`
+    // sits well below the others. Raise these to whatever the suite achieves.
     './src/ghostfolio.js': {
-      statements: 93,
-      branches: 88,
-      functions: 83,
-      lines: 93,
+      statements: 98,
+      branches: 97,
+      functions: 87,
+      lines: 98,
     },
     './src/config/': {
       statements: 100,

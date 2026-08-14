@@ -9,7 +9,9 @@ const {
   validateBalance,
   validateFactor,
   validateAccountName,
+  validateAccountId,
   validateDataDir,
+  isPrivateHost,
   errorMessageOf,
   redactSecrets,
   sanitizeError,
@@ -109,6 +111,35 @@ describe('validateBalance', () => {
     for (const value of ['100', null, undefined, {}, []]) {
       expect(() => validateBalance(value)).toThrow(/must be a finite number/);
     }
+  });
+
+  it('rejects a magnitude no real balance reaches', () => {
+    // A finite number was the only requirement, so a corrupted read of 1e20 was
+    // written to Ghostfolio verbatim. This runs on the Actual Budget fetch too,
+    // where Promise.all means one such value fails the whole read and nothing at
+    // all is written.
+    for (const value of [1e20, -1e20, constants.MAX_BALANCE_MINOR_UNITS + 1]) {
+      expect(() => validateBalance(value)).toThrow(/magnitude exceeds/);
+    }
+
+    expect(validateBalance(constants.MAX_BALANCE_MINOR_UNITS)).toBe(
+      constants.MAX_BALANCE_MINOR_UNITS
+    );
+  });
+
+  it('keeps the offending balance out of its error message', () => {
+    // These messages are logged and joined into the run summary. The message names
+    // the limit, which is a constant; it must not name the value, which is money.
+    let message = '';
+    try {
+      validateBalance(1.23456789e15);
+    } catch (error) {
+      message = error.message;
+    }
+
+    expect(message).toMatch(/magnitude exceeds/);
+    expect(message).not.toContain('1.23456789');
+    expect(message).not.toContain('123456789');
   });
 });
 
@@ -221,29 +252,100 @@ describe('validateEnvironment', () => {
     expect(() => validateEnvironment(env)).toThrow(/GHOSTFOLIO_URL/);
   });
 
-  it('requires HTTPS for both services in production', () => {
-    const actual = {
-      ...validEnv(),
-      NODE_ENV: 'production',
-      ACTUAL_BUDGET_URL: 'http://budget.example.com',
-    };
-    expect(() => validateEnvironment(actual)).toThrow(/ACTUAL_BUDGET_URL must use HTTPS/);
+  it('refuses plaintext HTTP to a public host, in every environment', () => {
+    // The rule used to apply only when NODE_ENV=production, which meant a developer
+    // who had not set NODE_ENV sent the password and the token in the clear to
+    // whatever remote host was configured. Both cases below are checked with
+    // NODE_ENV unset.
+    const actual = { ...validEnv(), ACTUAL_BUDGET_URL: 'http://budget.example.com' };
+    expect(() => validateEnvironment(actual)).toThrow(/ACTUAL_BUDGET_URL must use https/);
 
-    const ghostfolio = {
-      ...validEnv(),
-      NODE_ENV: 'production',
-      GHOSTFOLIO_URL: 'http://ghostfolio.example.com',
-    };
-    expect(() => validateEnvironment(ghostfolio)).toThrow(/GHOSTFOLIO_URL must use HTTPS/);
+    const ghostfolio = { ...validEnv(), GHOSTFOLIO_URL: 'http://ghostfolio.example.com' };
+    expect(() => validateEnvironment(ghostfolio)).toThrow(/GHOSTFOLIO_URL must use https/);
+
+    // A public IP literal is not a private host either.
+    const publicIp = { ...validEnv(), GHOSTFOLIO_URL: 'http://93.184.216.34:3333' };
+    expect(() => validateEnvironment(publicIp)).toThrow(/must use https/);
   });
 
-  it('allows plain HTTP against localhost outside production', () => {
-    const env = {
-      ...validEnv(),
-      ACTUAL_BUDGET_URL: 'http://localhost:5006',
-      GHOSTFOLIO_URL: 'http://127.0.0.1:3333',
-    };
-    expect(() => validateEnvironment(env)).not.toThrow();
+  it('records a security event when a credential would cross the network in the clear', () => {
+    const AuditLogger = require('../src/utils/audit');
+    const logSecurityEvent = jest.spyOn(AuditLogger, 'logSecurityEvent').mockImplementation();
+
+    try {
+      expect(() =>
+        validateEnvironment({ ...validEnv(), GHOSTFOLIO_URL: 'http://ghostfolio.example.com' })
+      ).toThrow();
+
+      expect(logSecurityEvent).toHaveBeenCalledWith('insecure_transport', 'high', {
+        variable: 'GHOSTFOLIO_URL',
+      });
+    } finally {
+      logSecurityEvent.mockRestore();
+    }
+  });
+
+  it('allows plaintext HTTP to a host only a local network can reach', () => {
+    // Including NODE_ENV=production, which is what the image sets. The old rule made
+    // the deployment this project recommends impossible to start: a compose file
+    // reaching Ghostfolio at its service name over the container network was
+    // rejected, and so was .env.example as shipped.
+    const hosts = [
+      'http://localhost:5006',
+      'http://127.0.0.1:3333',
+      'http://actual_server:5006', // Docker Compose service name
+      'http://ghostfolio', // single-label host
+      'http://10.1.2.3:3333',
+      'http://172.20.0.5:3333',
+      'http://192.168.1.50:3333',
+      'http://169.254.10.10:3333', // link-local
+      'http://budget.local:5006', // mDNS
+      'http://ghostfolio.internal:3333',
+      'http://[::1]:3333',
+      'http://[fd00::1]:3333', // IPv6 unique-local
+      'http://[fe80::1]:3333', // IPv6 link-local
+      'https://budget.example.com', // HTTPS anywhere, always
+    ];
+
+    for (const url of hosts) {
+      const env = { ...validEnv(), NODE_ENV: 'production', GHOSTFOLIO_URL: url };
+      expect(() => validateEnvironment(env)).not.toThrow();
+    }
+  });
+
+  it('classifies hosts without being reached through the schema', () => {
+    // isPrivateHost is exported so the boundary cases can be stated directly rather
+    // than inferred from which URLs happen to be accepted.
+    expect(isPrivateHost('172.15.0.1')).toBe(false); // just below the RFC 1918 range
+    expect(isPrivateHost('172.32.0.1')).toBe(false); // just above it
+    expect(isPrivateHost('172.16.0.1')).toBe(true);
+    expect(isPrivateHost('172.31.255.254')).toBe(true);
+    expect(isPrivateHost('11.0.0.1')).toBe(false);
+    expect(isPrivateHost('192.169.1.1')).toBe(false);
+    expect(isPrivateHost('example.com')).toBe(false);
+    expect(isPrivateHost('LOCALHOST')).toBe(true);
+    expect(isPrivateHost('app.localhost')).toBe(true);
+    expect(isPrivateHost('0:0:0:0:0:0:0:1')).toBe(true);
+    expect(isPrivateHost('2606:4700::1111')).toBe(false);
+  });
+
+  it('rejects a URL string the schema accepts but URL() cannot parse', () => {
+    // Joi's uri() and the WHATWG URL parser are not the same grammar: a port above
+    // 65535 satisfies the first and fails the second. The transport check states its
+    // own precondition rather than assuming the schema has established it, because
+    // otherwise an unparseable URL would take the code path for a *secure* one.
+    const env = { ...validEnv(), GHOSTFOLIO_URL: 'http://ghostfolio:99999' };
+
+    expect(() => validateEnvironment(env)).toThrow('GHOSTFOLIO_URL is not a valid URL');
+  });
+
+  it('reads DRY_RUN as a boolean and defaults it to off', () => {
+    // Environment variables are strings; a flag that decides whether anything is
+    // written must not be true merely because 'false' is a non-empty string.
+    expect(validateEnvironment(validEnv()).DRY_RUN).toBe(false);
+    expect(validateEnvironment({ ...validEnv(), DRY_RUN: 'true' }).DRY_RUN).toBe(true);
+    expect(validateEnvironment({ ...validEnv(), DRY_RUN: 'false' }).DRY_RUN).toBe(false);
+    expect(() => validateEnvironment({ ...validEnv(), DRY_RUN: 'yes' })).toThrow(/DRY_RUN/);
   });
 
   it('ignores unknown variables instead of failing on them', () => {
@@ -260,19 +362,24 @@ describe('validateEnvironment', () => {
 });
 
 describe('validateConfig', () => {
+  const mapping = (extra = {}) => ({
+    ghostfolioName: 'A',
+    actualBudgetName: 'B',
+    currency: 'EUR',
+    ...extra,
+  });
+
   it('accepts a valid mapping and defaults the factor to 1', () => {
-    const value = validateConfig({
-      accounts: [{ ghostfolioName: 'A', actualBudgetName: 'B' }],
-    });
+    const value = validateConfig({ accounts: [mapping()] });
 
     expect(value.accounts[0].factor).toBe(1);
   });
 
   it('rejects a non-positive factor', () => {
     for (const factor of [0, -1]) {
-      expect(() =>
-        validateConfig({ accounts: [{ ghostfolioName: 'A', actualBudgetName: 'B', factor }] })
-      ).toThrow(/Invalid configuration/);
+      expect(() => validateConfig({ accounts: [mapping({ factor })] })).toThrow(
+        /Invalid configuration/
+      );
     }
   });
 
@@ -283,12 +390,103 @@ describe('validateConfig', () => {
 
   it('strips unknown keys rather than trusting them', () => {
     const value = validateConfig({
-      accounts: [{ ghostfolioName: 'A', actualBudgetName: 'B', injected: 'x' }],
+      accounts: [mapping({ injected: 'x' })],
       extra: true,
     });
 
     expect(value.accounts[0].injected).toBeUndefined();
     expect(value.extra).toBeUndefined();
+  });
+
+  it('requires a currency and says why in the message', () => {
+    // Without a declared currency, a balance in one currency is written verbatim
+    // into an account denominated in another: no error, just the wrong amount of
+    // money from then on. Neither API reports the currency of an Actual Budget
+    // balance, so the only place it can come from is the config.
+    const withoutCurrency = mapping();
+    delete withoutCurrency.currency;
+
+    expect(() => validateConfig({ accounts: [withoutCurrency] })).toThrow(/"currency" is required/);
+    expect(() => validateConfig({ accounts: [withoutCurrency] })).toThrow(/ISO 4217/);
+  });
+
+  it('normalizes a currency and rejects one that is not an ISO 4217 code', () => {
+    expect(
+      validateConfig({ accounts: [mapping({ currency: ' eur ' })] }).accounts[0].currency
+    ).toBe('EUR');
+
+    for (const currency of ['EURO', 'EU', '€', '123']) {
+      expect(() => validateConfig({ accounts: [mapping({ currency })] })).toThrow(
+        /Invalid configuration/
+      );
+    }
+  });
+
+  it('refuses two mappings that target one Ghostfolio account', () => {
+    // These are not additive: each mapping is a full PUT of the account's balance,
+    // so the second silently overwrites the first and the run reports success.
+    expect(() =>
+      validateConfig({
+        accounts: [mapping({ actualBudgetName: 'Stocks' }), mapping({ actualBudgetName: 'Bonds' })],
+      })
+    ).toThrow(/duplicate value/);
+  });
+
+  it('sees through whitespace when checking for a duplicate target', () => {
+    expect(() =>
+      validateConfig({
+        accounts: [
+          mapping({ ghostfolioName: 'Savings', actualBudgetName: 'Stocks' }),
+          mapping({ ghostfolioName: '  Savings  ', actualBudgetName: 'Bonds' }),
+        ],
+      })
+    ).toThrow(/duplicate value/);
+  });
+
+  it('allows one Actual Budget account to feed two different Ghostfolio accounts', () => {
+    // Unusual but not lossy: two distinct targets each get a write of their own.
+    expect(() =>
+      validateConfig({
+        accounts: [mapping({ ghostfolioName: 'A' }), mapping({ ghostfolioName: 'B' })],
+      })
+    ).not.toThrow();
+  });
+
+  it('validates config.json.example as shipped', () => {
+    // The example is what an operator copies, and a required field added to the
+    // schema without being added there makes the documented first run fail.
+    const example = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', 'config.json.example'), 'utf8')
+    );
+
+    expect(() => validateConfig(example)).not.toThrow();
+  });
+});
+
+describe('validateAccountId', () => {
+  it('accepts the identifier shapes Ghostfolio issues', () => {
+    for (const id of ['123', 'clx1a2b3c4d5e6f7g8h9', '0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9']) {
+      expect(validateAccountId(id)).toBe(id);
+    }
+  });
+
+  it('refuses an id that would address a different endpoint', () => {
+    // The id is interpolated into the request path. It comes from Ghostfolio's own
+    // response, so this is defence in depth rather than a likely attack — but "the
+    // server told us" is not a reason to build a URL out of a value.
+    for (const id of ['../../auth/anonymous', 'abc?query=1', 'abc/def', 'a b']) {
+      expect(() => validateAccountId(id)).toThrow(/unexpected characters/);
+    }
+  });
+
+  it('refuses an absent, non-string or oversized id', () => {
+    for (const id of [undefined, null, '', 42, {}]) {
+      expect(() => validateAccountId(id)).toThrow(/non-empty string/);
+    }
+
+    expect(() => validateAccountId('a'.repeat(constants.MAX_ACCOUNT_ID_LENGTH + 1))).toThrow(
+      /must not exceed/
+    );
   });
 });
 

@@ -2,11 +2,13 @@
   "accounts": [
     {
       "ghostfolioName": "Savings Account",
-      "actualBudgetName": "Main Savings"
+      "actualBudgetName": "Main Savings",
+      "currency": "EUR"
     },
     {
-      "ghostfolioName": "Investment Account",
-      "actualBudgetName": "Brokerage Account"
+      "ghostfolioName": "Current Account",
+      "actualBudgetName": "Checking",
+      "currency": "EUR"
     }
   ]
 }

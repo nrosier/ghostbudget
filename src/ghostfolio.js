@@ -15,9 +15,44 @@ const {
   validateBalance,
   validateFactor,
   validateAccountName,
+  validateAccountId,
   errorMessageOf,
   sanitizeError,
 } = require('./utils/validation');
+
+/**
+ * The single account with this name, or an error saying why there isn't one.
+ *
+ * This was `Array.prototype.find()` on both sides of a mapping, which takes the
+ * first match and says nothing about the rest. Neither system enforces unique
+ * account names, so two accounts named "Savings" meant the balance went to
+ * whichever one the API happened to list first — the other was never touched, the
+ * run reported success, and nothing anywhere said the name had been ambiguous. For
+ * a mapping that addresses accounts *by name*, more than one match is not something
+ * to resolve by picking; it is a configuration that cannot be carried out.
+ *
+ * @param {Array} accounts - Accounts to search
+ * @param {string} name - Exact account name to match
+ * @param {string} side - Which system, for the error message
+ * @returns {Object} The single matching account
+ * @throws {Error} If no account matches, or more than one does
+ */
+function exactlyOneNamed(accounts, name, side) {
+  const matches = accounts.filter((account) => account?.name === name);
+
+  if (matches.length === 0) {
+    throw new Error(`No matching ${side} account found for ${name}`);
+  }
+
+  if (matches.length > 1) {
+    throw new Error(
+      `Ambiguous mapping: ${matches.length} ${side} accounts are named ${name}. ` +
+        'Rename one of them so the mapping addresses exactly one account.'
+    );
+  }
+
+  return matches[0];
+}
 
 /**
  * The fields Ghostfolio's `UpdateAccountDto` accepts, besides `balance`.
@@ -58,6 +93,9 @@ class GhostfolioAPI {
     this.securityToken = env.GHOSTFOLIO_TOKEN;
     this.accessToken = null;
     this.configPath = path.join(__dirname, '..', 'config.json');
+    // Resolve and report, write nothing. Read once here rather than from
+    // process.env at each write, so a run cannot change mode halfway through.
+    this.dryRun = env.DRY_RUN === true;
 
     // A local, not a field: the only reader is the axiosRetry call below. As
     // `this.maxRetries` it looked like state something outside might consult.
@@ -192,14 +230,58 @@ class GhostfolioAPI {
     }
   }
 
+  /**
+   * Confirm that Ghostfolio stored the balance that was sent.
+   *
+   * A 2xx used to be the whole of the success criterion, and it is not the same
+   * claim: the update response carries the account as it now stands, so the value
+   * actually stored is right there and was being discarded. Comparing it turns
+   * "the server accepted the request" into "the balance in Ghostfolio is the
+   * balance from Actual Budget", which is the only thing this tool exists to
+   * assert.
+   *
+   * No balance appears in the message or the log line, here or anywhere else. The
+   * operator can read both values in Ghostfolio's own UI; a log file on a mounted
+   * volume is not the place for them.
+   *
+   * @param {string} accountName - Account name, for the message
+   * @param {number} sentBalance - Balance sent in the update, in major units
+   * @param {*} responseData - Body of the update response
+   * @throws {Error} If the stored balance differs from the one sent
+   */
+  verifyStoredBalance(accountName, sentBalance, responseData) {
+    const stored = responseData?.balance;
+
+    if (typeof stored !== 'number' || !Number.isFinite(stored)) {
+      // Not an error: a Ghostfolio version that answers with an empty body, or a
+      // proxy that strips it, has not told us the write went wrong either. Say
+      // plainly that it is unconfirmed rather than implying it was checked.
+      logger.warn(
+        `Could not confirm the stored balance for account ${accountName}: ` +
+          'the update response carried no balance field',
+        { account: accountName }
+      );
+      return;
+    }
+
+    if (Math.abs(stored - sentBalance) >= constants.BALANCE_EPSILON) {
+      throw new Error(
+        `Ghostfolio stored a different balance than was sent for account ${accountName}`
+      );
+    }
+  }
+
   async updateAccountBalance(ghostfolioAccount, actualBudgetBalance, factor = 1) {
     if (!this.accessToken) {
       throw new Error('Not authenticated. Call authenticate() first');
     }
 
     try {
-      // Validate inputs
-      validateAccountName(ghostfolioAccount.name);
+      // Validate inputs. The trimmed name is used for messages and audit records
+      // only — the payload carries the name exactly as Ghostfolio returned it,
+      // because a PUT that sends a different name renames the account.
+      const accountName = validateAccountName(ghostfolioAccount.name);
+      const accountId = validateAccountId(ghostfolioAccount.id);
       const validatedBalance = validateBalance(actualBudgetBalance);
       const validatedFactor = validateFactor(factor);
 
@@ -210,14 +292,41 @@ class GhostfolioAPI {
       // account's balance.
       const newBalance = Math.round(validatedBalance * validatedFactor) / 100;
 
-      // The previous balance is only used to decide whether this write changes
-      // anything. It is compared, never logged.
+      // The previous balance decides whether this write happens at all. It is
+      // compared, never logged. A previous balance that is absent or unreadable
+      // counts as a change: unknown state is resolved by writing, not by skipping.
       const previousBalance = Number(ghostfolioAccount.balance);
-      const changed = !Number.isFinite(previousBalance) || previousBalance !== newBalance;
+      const changed =
+        !Number.isFinite(previousBalance) ||
+        Math.abs(previousBalance - newBalance) >= constants.BALANCE_EPSILON;
+
+      // Nothing to do, so nothing is sent. The PUT used to fire regardless — the
+      // `changed` flag only decided what the audit trail said about it — which
+      // meant a nightly run rewrote every mapped account's balance every night,
+      // including the ones that had not moved. Every write is an opportunity to
+      // store the wrong number; the cheapest way to not store a wrong number is to
+      // not write. On a typical run this skips all of them.
+      if (!changed) {
+        logger.info(`Balance for account ${accountName} is already correct; no write sent`);
+        AuditLogger.logBalanceUpdate(accountName, false, {
+          service: 'ghostfolio',
+          written: false,
+        });
+        return null;
+      }
+
+      if (this.dryRun) {
+        logger.info(`DRY_RUN: would update the balance of account ${accountName}`);
+        AuditLogger.logBalanceUpdate(accountName, true, {
+          service: 'ghostfolio',
+          written: false,
+          dry_run: true,
+        });
+        return null;
+      }
 
       logger.debug('Updating account balance', {
-        account: ghostfolioAccount.name,
-        changed,
+        account: accountName,
         // Balance values are deliberately absent
       });
 
@@ -235,7 +344,10 @@ class GhostfolioAPI {
 
       const response = await this.axiosInstance({
         method: 'PUT',
-        url: `${this.baseURL}/api/v1/account/${ghostfolioAccount.id}`,
+        // encodeURIComponent on top of validateAccountId: the validator already
+        // restricts the character set, and encoding costs nothing for an id that
+        // passed it. Neither is load-bearing alone.
+        url: `${this.baseURL}/api/v1/account/${encodeURIComponent(accountId)}`,
         data: updateData,
         headers: {
           Authorization: `Bearer ${this.accessToken}`,
@@ -243,12 +355,12 @@ class GhostfolioAPI {
         },
       });
 
-      logger.info(`Successfully updated balance for account ${ghostfolioAccount.name}`);
-      // `changed` is computed, not hardcoded. It used to be passed as a literal
-      // `true`, so the audit trail recorded a balance change for every account on
-      // every run and could not distinguish a real movement from a no-op write.
-      AuditLogger.logBalanceUpdate(ghostfolioAccount.name, changed, {
+      this.verifyStoredBalance(accountName, newBalance, response.data);
+
+      logger.info(`Successfully updated balance for account ${accountName}`);
+      AuditLogger.logBalanceUpdate(accountName, true, {
         service: 'ghostfolio',
+        written: true,
       });
 
       return response.data;
@@ -261,13 +373,15 @@ class GhostfolioAPI {
     }
   }
 
-  async syncAccountBalances(actualBalances) {
-    await this.authenticate();
-    const ghostfolioAccounts = await this.getGhostfolioAccounts();
-
+  /**
+   * Read and validate the account mappings.
+   *
+   * @returns {Object} Validated config
+   * @throws {Error} If the file cannot be read, parsed or validated
+   */
+  readAccountMappings() {
     logger.debug('Reading account mappings from config...');
 
-    // Read and validate config
     let configData;
     try {
       // configPath is set in the constructor from __dirname; it is not derived from input.
@@ -279,38 +393,118 @@ class GhostfolioAPI {
       throw new Error(`Config file error: ${errorMessageOf(error)}`);
     }
 
-    const config = validateConfig(configData);
+    return validateConfig(configData);
+  }
+
+  /**
+   * Turn one mapping into the write it describes, or explain why it cannot be one.
+   *
+   * Every check that can be made without contacting Ghostfolio is made here, and
+   * this method sends nothing. That separation is the point: it lets the caller
+   * inspect the whole set of intended writes before the first one happens.
+   *
+   * @param {Object} mapping - One validated entry from config.accounts
+   * @param {Array} actualBalances - Balances from Actual Budget
+   * @param {Array} ghostfolioAccounts - Accounts from Ghostfolio
+   * @returns {{ghostfolioAccount: Object, balance: number, factor: number}} Intended write
+   * @throws {Error} If the mapping cannot be carried out
+   */
+  resolveMapping(mapping, actualBalances, ghostfolioAccounts) {
+    const actualAccountName = validateAccountName(mapping.actualBudgetName);
+    const ghostfolioAccountName = validateAccountName(mapping.ghostfolioName);
+
+    const actualAccount = exactlyOneNamed(actualBalances, actualAccountName, 'Actual Budget');
+    const ghostfolioAccount = exactlyOneNamed(
+      ghostfolioAccounts,
+      ghostfolioAccountName,
+      'Ghostfolio'
+    );
+
+    // Neither API states the currency of an Actual Budget balance, so the config
+    // declares it and this compares. Without it a balance denominated in one
+    // currency was written verbatim into an account denominated in another — no
+    // error, no warning, just the wrong amount of money from then on. `factor` is
+    // not a substitute: using it as an exchange rate freezes that rate into the
+    // config, where it silently goes stale.
+    const accountCurrency = String(ghostfolioAccount.currency ?? '')
+      .trim()
+      .toUpperCase();
+
+    if (accountCurrency !== mapping.currency) {
+      throw new Error(
+        `Currency mismatch for account ${ghostfolioAccountName}: config.json declares ` +
+          `${mapping.currency}, the Ghostfolio account is denominated in ` +
+          `${accountCurrency || '(unset)'}`
+      );
+    }
+
+    return {
+      ghostfolioAccount,
+      // Validated here as well as in updateAccountBalance, so the zero-balance gate
+      // below is deciding over values already known to be sane numbers.
+      balance: validateBalance(actualAccount.balance),
+      // The Joi config schema already applies `positive()` with a default of 1;
+      // validateFactor is the same rule enforced at the point of use, so the
+      // guarantee does not depend on which path the value arrived by.
+      factor: validateFactor(mapping.factor),
+    };
+  }
+
+  async syncAccountBalances(actualBalances) {
+    // Config first. It used to be read after authenticating, so a mistyped
+    // config.json still exchanged the security token for an auth token and fetched
+    // the account list before failing on something local to this machine.
+    const config = this.readAccountMappings();
+
+    await this.authenticate();
+    const ghostfolioAccounts = await this.getGhostfolioAccounts();
+
     const errors = [];
 
+    // Phase one: work out every intended write. Nothing is sent in this loop.
+    //
+    // Resolution used to be interleaved with writing, one mapping at a time, which
+    // meant the first accounts were already written before the later ones had been
+    // looked at — so a check that depends on the whole set could not exist. Both
+    // phases still record per-mapping failures and carry on, so one bad mapping
+    // does not cost the others their sync.
+    const targets = [];
     for (const mapping of config.accounts) {
       try {
-        // Validate mapping fields
-        const actualAccountName = validateAccountName(mapping.actualBudgetName);
-        const ghostfolioAccountName = validateAccountName(mapping.ghostfolioName);
-
-        const actualAccount = actualBalances.find((acc) => acc.name === actualAccountName);
-        const ghostfolioAccount = ghostfolioAccounts.find(
-          (acc) => acc.name === ghostfolioAccountName
-        );
-
-        if (!actualAccount) {
-          throw new Error(`No matching Actual Budget account found for ${actualAccountName}`);
-        }
-
-        if (!ghostfolioAccount) {
-          throw new Error(`No matching Ghostfolio account found for ${ghostfolioAccountName}`);
-        }
-
-        // The Joi config schema already applies `positive()` with a default of 1;
-        // validateFactor is the same rule enforced at the point of use, so the
-        // guarantee does not depend on which path the value arrived by.
-        const factor = validateFactor(mapping.factor);
-
-        await this.updateAccountBalance(ghostfolioAccount, actualAccount.balance, factor);
+        targets.push(this.resolveMapping(mapping, actualBalances, ghostfolioAccounts));
       } catch (error) {
-        logger.error('Account sync failed', sanitizeError(error));
+        logger.error('Account mapping could not be resolved', sanitizeError(error));
         // Redacted and non-Error-safe: these messages are joined into the thrown
         // summary below, which is itself logged and audited.
+        errors.push(errorMessageOf(error));
+      }
+    }
+
+    // The gate, and the reason there are two phases.
+    //
+    // A zero is a valid balance — an emptied account really does hold nothing — so
+    // no single value can be rejected on its own. Every mapped account reading zero
+    // at once is a different claim, and not one a real set of accounts makes. It is
+    // what a budget that downloaded but did not apply its sync messages looks like,
+    // or a wrong ACTUAL_BUDGET_SYNC_ID pointing at an empty budget. None of those
+    // throw, so every guard upstream passes and the run would overwrite real
+    // balances with zeros and report success. Refusing here, before phase two,
+    // means not one account is touched.
+    if (targets.length > 0 && targets.every((target) => target.balance === 0)) {
+      throw new Error(
+        `Refusing to sync: all ${targets.length} resolved account(s) report a zero balance, ` +
+          'which is what a failed or empty Actual Budget download looks like rather than a ' +
+          'set of real balances. Nothing was written. Check ACTUAL_BUDGET_SYNC_ID and that ' +
+          'the budget has finished syncing.'
+      );
+    }
+
+    // Phase two: write.
+    for (const target of targets) {
+      try {
+        await this.updateAccountBalance(target.ghostfolioAccount, target.balance, target.factor);
+      } catch (error) {
+        logger.error('Account sync failed', sanitizeError(error));
         errors.push(errorMessageOf(error));
       }
     }
@@ -319,7 +513,11 @@ class GhostfolioAPI {
       throw new Error(`Failed to sync ${errors.length} account(s): ${errors.join('; ')}`);
     }
 
-    logger.info('Successfully synced all account balances');
+    logger.info(
+      this.dryRun
+        ? 'DRY_RUN: every account mapping resolved and no balance was written'
+        : 'Successfully synced all account balances'
+    );
   }
 }
 

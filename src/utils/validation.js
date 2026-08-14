@@ -37,6 +37,20 @@ const PROTECTED_DATA_DIRS = new Set([
 
 /**
  * Schema for validating config.json structure
+ *
+ * `currency` is required, and deliberately so. Nothing in either API tells this
+ * tool which currency an Actual Budget balance is denominated in — Actual is
+ * single-currency per budget file and does not report it per account, while
+ * Ghostfolio is per-account — so without a declared expectation a balance in one
+ * currency is written verbatim into an account denominated in another and simply
+ * reads as the wrong amount of money. Declaring it turns a silent wrong value into
+ * a refused write.
+ *
+ * `unique('ghostfolioName')` is the other half of the same idea. Two mappings
+ * pointing at one Ghostfolio account are not additive: each is a full PUT of the
+ * account's balance, so the second overwrites the first and the run still reports
+ * success. Uniqueness runs on the trimmed values, so " Savings " and "Savings" are
+ * caught as the duplicate they are.
  */
 const configSchema = Joi.object({
   accounts: Joi.array()
@@ -44,10 +58,22 @@ const configSchema = Joi.object({
       Joi.object({
         ghostfolioName: Joi.string().trim().min(1).max(255).required(),
         actualBudgetName: Joi.string().trim().min(1).max(255).required(),
+        currency: Joi.string()
+          .trim()
+          .uppercase()
+          .pattern(/^[A-Z]{3}$/)
+          .required()
+          .messages({
+            'any.required':
+              '"currency" is required: the ISO 4217 code the Actual Budget balance ' +
+              'is denominated in, e.g. "EUR". It is checked against the Ghostfolio ' +
+              "account's own currency so a mismatch refuses the write.",
+          }),
         factor: Joi.number().positive().default(1),
       })
     )
     .min(1)
+    .unique('ghostfolioName')
     .required(),
 }).required();
 
@@ -55,20 +81,28 @@ const configSchema = Joi.object({
  * Schema for validating environment variables
  */
 const envSchema = Joi.object({
+  // Shape only. Which schemes are acceptable for which hosts is decided by
+  // assertTransportSecurity below, which needs the parsed host to say anything
+  // useful. The host allowlist that used to live in a pattern here is gone: it
+  // permitted only localhost, 127.0.0.1 and dotted names with a TLD, so
+  // `http://actual_server:5006` — a Docker Compose service name, which is what the
+  // recommended deployment actually uses — was rejected outright.
   ACTUAL_BUDGET_URL: Joi.string()
     .uri({ scheme: ['http', 'https'] })
-    .pattern(/^https?:\/\/(localhost|127\.0\.0\.1|[\w\-\.]+\.[a-z]{2,})/)
     .required(),
   ACTUAL_BUDGET_PASS: Joi.string().min(constants.MIN_PASSWORD_LENGTH).required(),
   ACTUAL_BUDGET_SYNC_ID: Joi.string().min(1).required(),
   ACTUAL_BUDGET_DATA_DIR: Joi.string().allow('').optional(),
   GHOSTFOLIO_URL: Joi.string()
     .uri({ scheme: ['http', 'https'] })
-    .pattern(/^https?:\/\/(localhost|127\.0\.0\.1|[\w\-\.]+\.[a-z]{2,})/)
     .required(),
   GHOSTFOLIO_TOKEN: Joi.string().min(constants.MIN_TOKEN_LENGTH).required(),
   LOG_LEVEL: Joi.string().valid('error', 'warn', 'info', 'debug').default('info'),
   NODE_ENV: Joi.string().valid('development', 'production', 'test').default('production'),
+  // Resolve every mapping, report exactly what would change, send no write. The
+  // only thing this tool does to Ghostfolio is overwrite balances, so being able
+  // to check a new or edited config.json without doing that is worth one flag.
+  DRY_RUN: Joi.boolean().default(false),
   // CACHE_TTL_MINUTES and BATCH_SIZE are both gone, for the same reason: each
   // configured something that could not take effect in a one-shot process — a
   // cache that never served a read, and batches over a synchronous local database.
@@ -100,6 +134,96 @@ function validateConfig(config) {
 }
 
 /**
+ * Whether plaintext HTTP to this host keeps the credential off the network.
+ *
+ * Loopback, an RFC 1918 or IPv6 unique-local address, an mDNS/internal suffix, or
+ * a single-label name — which has no public DNS answer, so it can only be a
+ * container-network service, a Kubernetes service, or an /etc/hosts entry.
+ *
+ * @param {string} hostname - Host component of a URL, as `new URL().hostname`
+ * @returns {boolean} True if the host is reachable only from a local network
+ */
+function isPrivateHost(hostname) {
+  // new URL() returns an IPv6 literal wrapped in brackets.
+  const host = hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+
+  if (host === 'localhost' || host.endsWith('.localhost')) {
+    return true;
+  }
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') {
+    return true;
+  }
+  if (host.endsWith('.local') || host.endsWith('.internal')) {
+    return true;
+  }
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10)
+  if (/^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host)) {
+    return true;
+  }
+
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const [a, b] = ipv4.slice(1).map(Number);
+    return (
+      a === 127 || // loopback
+      a === 10 || // RFC 1918
+      (a === 172 && b >= 16 && b <= 31) || // RFC 1918
+      (a === 192 && b === 168) || // RFC 1918
+      (a === 169 && b === 254) // link-local
+    );
+  }
+
+  // A name with no dot and no colon is single-label: not a public DNS name.
+  return !host.includes('.') && !host.includes(':');
+}
+
+/**
+ * Refuse to send a credential in plaintext to a host that is not local.
+ *
+ * This replaces a rule that required HTTPS only when `NODE_ENV=production`, which
+ * was wrong in both directions. It was too strict for the deployment this project
+ * recommends: the image sets `NODE_ENV=production`, so a compose file talking to
+ * `http://actual_server:5006` over the container network could not start at all —
+ * and `.env.example`, which ships `NODE_ENV=production` alongside `http://localhost`
+ * URLs, could not start either. It was also too lax where it mattered, because a
+ * developer who had not set NODE_ENV sent the Actual Budget password and the
+ * Ghostfolio token in the clear to whatever remote host was configured.
+ *
+ * Keying on the host instead protects the case that is actually dangerous —
+ * credentials crossing a network someone else can see — in every environment, and
+ * permits the case that is not.
+ *
+ * @param {string} name - Environment variable name, for the error message
+ * @param {string} value - URL to check
+ * @throws {Error} If the URL is unparseable, or is plaintext to a non-local host
+ */
+function assertTransportSecurity(name, value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} is not a valid URL`);
+  }
+
+  if (url.protocol === 'https:') {
+    return;
+  }
+
+  if (!isPrivateHost(url.hostname)) {
+    AuditLogger.logSecurityEvent('insecure_transport', 'high', { variable: name });
+    throw new Error(
+      `${name} must use https:// — plaintext HTTP would send the credential across ` +
+        'the network. HTTP is accepted only for a loopback or private-network address, ' +
+        'or a single-label host such as a Docker Compose service name.'
+    );
+  }
+
+  // Debug, not warn: this is the recommended deployment, and a warning on every
+  // run of a supported configuration only teaches an operator to ignore warnings.
+  logger.debug(`${name} uses plaintext HTTP to a private host`, { variable: name });
+}
+
+/**
  * Validate environment variables
  * @param {Object} env - Environment variables object (typically process.env)
  * @returns {Object} Validated environment variables
@@ -118,22 +242,27 @@ function validateEnvironment(env) {
     throw new Error(`Invalid environment variables: ${details}`);
   }
 
-  // Validate URLs are HTTPS in production
-  if (value.NODE_ENV === 'production') {
-    if (!value.ACTUAL_BUDGET_URL.startsWith('https://')) {
-      throw new Error('ACTUAL_BUDGET_URL must use HTTPS in production');
-    }
-    if (!value.GHOSTFOLIO_URL.startsWith('https://')) {
-      throw new Error('GHOSTFOLIO_URL must use HTTPS in production');
-    }
-  }
+  // Checked in every environment, not only production — see assertTransportSecurity.
+  assertTransportSecurity('ACTUAL_BUDGET_URL', value.ACTUAL_BUDGET_URL);
+  assertTransportSecurity('GHOSTFOLIO_URL', value.GHOSTFOLIO_URL);
 
   logger.debug('Environment variables validated successfully');
   return value;
 }
 
 /**
- * Validate account balance
+ * Validate an account balance in minor units.
+ *
+ * Zero and negative values pass: an emptied account and an overdraft are both real
+ * balances, and refusing them here would refuse to sync the truth. What is checked
+ * is the magnitude, which no genuine personal balance approaches — see
+ * MAX_BALANCE_MINOR_UNITS. Note the error message names no value: these messages
+ * are logged and joined into the run summary, and a balance is not something to
+ * write to a log file.
+ *
+ * The all-zero condition is a different question, and not one a single value can
+ * answer; it is handled where the whole mapped set is known, in ghostfolio.js.
+ *
  * @param {*} balance - Balance value to validate
  * @returns {number} Validated balance
  * @throws {Error} If validation fails
@@ -142,7 +271,42 @@ function validateBalance(balance) {
   if (typeof balance !== 'number' || !Number.isFinite(balance)) {
     throw new Error(`Invalid balance: must be a finite number, got ${typeof balance}`);
   }
+  if (Math.abs(balance) > constants.MAX_BALANCE_MINOR_UNITS) {
+    throw new Error(
+      `Invalid balance: magnitude exceeds ${constants.MAX_BALANCE_MINOR_UNITS} minor units, ` +
+        'which is a corrupted read rather than a balance'
+    );
+  }
   return balance;
+}
+
+/**
+ * Validate a Ghostfolio account id before it is interpolated into a request path.
+ *
+ * The id comes from Ghostfolio's own response, so this is defence in depth rather
+ * than a likely attack — but "the server told us" is not a reason to build a URL
+ * out of a value, and a `../` or a query string in this position would address a
+ * different endpoint entirely. Ghostfolio ids are generated identifiers, so the
+ * allowed character set costs nothing.
+ *
+ * @param {*} id - Account id from a Ghostfolio response
+ * @returns {string} Validated id
+ * @throws {Error} If validation fails
+ */
+function validateAccountId(id) {
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new Error('Ghostfolio account id must be a non-empty string');
+  }
+  if (id.length > constants.MAX_ACCOUNT_ID_LENGTH) {
+    throw new Error(
+      `Ghostfolio account id must not exceed ${constants.MAX_ACCOUNT_ID_LENGTH} characters`
+    );
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+    AuditLogger.logSecurityEvent('unexpected_account_id', 'high', { source: 'ghostfolio' });
+    throw new Error('Ghostfolio account id contains unexpected characters');
+  }
+  return id;
 }
 
 /**
@@ -416,7 +580,9 @@ module.exports = {
   validateBalance,
   validateFactor,
   validateAccountName,
+  validateAccountId,
   validateDataDir,
+  isPrivateHost,
   errorMessageOf,
   redactSecrets,
   sanitizeError,

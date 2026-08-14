@@ -14,6 +14,11 @@ const {
 } = require('./utils/validation');
 
 async function getAccountBalances() {
+  // Whether init() got far enough that there is something to close. Set before the
+  // await returns is not enough — a rejection from init() can still leave a socket
+  // or a SQLite handle open — so the flag is raised before the call.
+  let opened = false;
+
   try {
     // Validate environment variables
     const env = validateEnvironment(process.env);
@@ -21,6 +26,7 @@ async function getAccountBalances() {
     logger.debug('Initializing Actual Budget API...');
 
     // Initialize the Actual API client
+    opened = true;
     await api.init({
       dataDir: env.ACTUAL_BUDGET_DATA_DIR,
       serverURL: env.ACTUAL_BUDGET_URL.replace(/\/$/, ''),
@@ -70,9 +76,6 @@ async function getAccountBalances() {
     logger.info(`Successfully fetched balances for ${balances.length} accounts`);
     logger.debug('Fetched accounts', { accounts: balances.map((account) => account.name) });
 
-    // Close the connection
-    await api.shutdown();
-    logger.debug('Connection closed successfully');
     return balances;
   } catch (error) {
     // Log sanitized error (no stack traces or sensitive data)
@@ -92,6 +95,23 @@ async function getAccountBalances() {
 
     // Re-throw to allow caller to handle
     throw error;
+  } finally {
+    // The shutdown call used to be the last statement of the try block, so every
+    // path that threw after init() — a failed budget download, a rejected balance,
+    // an account name that did not validate — left the server connection and the
+    // local SQLite handle open until the process exited. Under the scheduler that
+    // process is a fork whose exit is not instant.
+    if (opened) {
+      try {
+        await api.shutdown();
+        logger.debug('Connection closed successfully');
+      } catch (shutdownError) {
+        // Never rethrown: on the failure path this would replace the error that
+        // actually explains the run, and on the success path a connection that
+        // cannot be closed cleanly does not invalidate balances already read.
+        logger.warn('Failed to close the Actual Budget connection', sanitizeError(shutdownError));
+      }
+    }
   }
 }
 

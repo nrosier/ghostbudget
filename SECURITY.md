@@ -1,8 +1,8 @@
 # Security Policy & Audit Report — GhostBudget
 
-**Last Updated:** 2026-08-13
+**Last Updated:** 2026-08-14
 **Application Version:** 1.0.0
-**Audit Version:** 3.1
+**Audit Version:** 3.2
 **Overall Risk Level:** 🟢 **LOW**
 
 ---
@@ -24,12 +24,22 @@ the breaker actively suppressed balance updates — see "Resilience & abuse
 protection" below. The application is considered **production-ready** from a
 security standpoint.
 
+The threat this tool has to answer for is not primarily disclosure — it holds no
+data of its own and has no inbound surface. It is **write integrity**: the one
+thing it does to Ghostfolio is overwrite account balances, so a failure that
+overwrites a correct balance with an incorrect one is more costly than a failure
+that writes nothing. Audit 3.2 is the pass that took that seriously — see
+"Write integrity" below. It assumes nothing about the two services being
+co-located or trusted, because a deployment that puts them on one Docker host is
+a convention, not a guarantee.
+
 | Risk area            | Status |
 | -------------------- | ------ |
 | Credential exposure  | 🟢 LOW |
 | Injection            | 🟢 LOW |
 | Container security   | 🟢 LOW |
 | Transport security   | 🟢 LOW |
+| Write integrity      | 🟢 LOW |
 | Operational security | 🟢 LOW |
 
 ---
@@ -68,9 +78,16 @@ repository to stay informed.
 - Joi schema validation for `config.json` account mappings (`validateConfig`)
   and environment variables (`validateEnvironment`) — see
   [src/utils/validation.js](src/utils/validation.js).
-- URL scheme/host validation plus an **HTTPS requirement in production** for
-  both `ACTUAL_BUDGET_URL` and `GHOSTFOLIO_URL`
-  ([src/utils/validation.js](src/utils/validation.js)).
+- **Plaintext HTTP is refused for any host outside a local network**, in every
+  environment, for both `ACTUAL_BUDGET_URL` and `GHOSTFOLIO_URL`
+  (`assertTransportSecurity`, `isPrivateHost` in
+  [src/utils/validation.js](src/utils/validation.js)). See "Transport security"
+  below for the host classification and why this replaced a `NODE_ENV` gate.
+- **`config.json` mappings must be unambiguous.** `currency` is required, and
+  `ghostfolioName` must be unique across the array (Joi `.unique()`, applied to
+  the trimmed values, so `'Savings'` and `' Savings '` collide). Two mappings
+  targeting one Ghostfolio account meant the second write silently overwrote the
+  first and the run reported success.
 - **Credential length minimums** are enforced at startup, so a placeholder or an
   empty-ish value fails fast instead of becoming a live credential:
   `ACTUAL_BUDGET_PASS` at least 8 characters, `GHOSTFOLIO_TOKEN` at least 16
@@ -89,6 +106,14 @@ repository to stay informed.
 - Money is converted in minor units — `Math.round(cents * factor) / 100` — so a
   factor cannot produce a float artefact that reaches a financial API. Multiplying
   in units instead sent values like `1100.1320000000001` to be stored as a balance.
+- A **magnitude bound** on balances (`MAX_BALANCE_MINOR_UNITS`): past it, the value
+  is a corrupted read rather than a balance. The error names the limit, never the
+  value that exceeded it.
+- **Account ids from Ghostfolio are validated** before being interpolated into a
+  request path (`validateAccountId`): a non-empty string, at most
+  `MAX_ACCOUNT_ID_LENGTH` characters, `[A-Za-z0-9_-]` only, and
+  `encodeURIComponent` on top of that. An id outside the set emits an
+  `unexpected_account_id` security event and no request is sent.
 - Defense-in-depth rejection of obviously malicious account names
   (`<script`, `javascript:`, `on*=`) at
   [src/utils/validation.js:198-206](src/utils/validation.js#L198-L206). Account
@@ -133,12 +158,67 @@ repository to stay informed.
   and the `uuid` dependency with them, since `crypto.randomUUID()` produces the
   correlation ID.
 - Balance-update events record **whether the balance actually changed**, compared
-  against the value Ghostfolio already held. This was a hardcoded `true` for every
-  account on every run, which made the audit trail useless for the one question it
-  exists to answer: what did this job change?
+  against the value Ghostfolio already held, and **whether a request was actually
+  sent** (`written`, plus `dry_run` under `DRY_RUN`). `changed` was a hardcoded
+  `true` for every account on every run, which made the audit trail useless for the
+  one question it exists to answer: what did this job change?
+
+### Write integrity ✅
+
+The only field this tool writes is `balance`, on accounts named in `config.json`.
+A wrong balance is worse than a stale one, so a run is arranged so that an error
+leaves the previous value in place. See
+[README](README.md#what-is-written-and-when-it-is-not) for the operator-facing
+version.
+
+- **Resolve everything, then write.** `syncAccountBalances` computes every intended
+  write before sending the first one. Resolution used to be interleaved with
+  writing, so the early accounts were already committed before the later ones had
+  been looked at, and a check spanning the whole set could not exist.
+- **`config.json` is read before authenticating**, so a local mistake does not
+  exchange a credential first.
+- **A run in which every mapped account resolves to zero writes nothing at all.** A
+  single zero is a real balance and is written. All of them at once is what a budget
+  that downloaded without applying its sync messages looks like, or a wrong
+  `ACTUAL_BUDGET_SYNC_ID`. None of those raise an error, so every upstream guard
+  passed and real balances were overwritten with zeros under a success report.
+- **A name matching more than one account is refused, not resolved by picking.**
+  This was `Array.prototype.find()` on both sides; neither system enforces unique
+  account names, so the balance went to whichever account the API happened to list
+  first, the other was never touched, and nothing said the name was ambiguous.
+- **Currency is compared, never converted.** Neither API states the currency of an
+  Actual Budget balance, so `config.json` declares it and it is checked against the
+  Ghostfolio account. A mismatch fails that account and the rest of the run
+  continues. Previously a balance in one currency was written verbatim into an
+  account denominated in another, with no error and no warning.
+- **Every write is read back.** Ghostfolio's update response carries the account as
+  stored; if the balance differs from the one sent (beyond `BALANCE_EPSILON`, half
+  a cent), that account fails. An HTTP 2xx alone is a weaker claim than "the
+  balance in Ghostfolio is the balance from Actual Budget". A response with no
+  balance field warns that the write is unconfirmed rather than failing it.
+- **Unchanged balances are not rewritten.** Every write is an opportunity to store
+  a wrong number. The PUT used to fire regardless of whether the value had moved.
+- **One failure does not stop the rest.** Per-mapping errors are collected and the
+  run exits non-zero with a count; the accounts that could be synced were.
+- **`DRY_RUN=true`** resolves and reports every mapping without sending a write.
 
 ### Transport security ✅
 
+- **Plaintext HTTP is rejected for any host that is not local**, in every
+  environment, before the process starts — the credential in each URL's request
+  would otherwise cross a network in the clear. `isPrivateHost` accepts
+  `localhost`, `127.0.0.0/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, IPv6
+  `::1` / `fc00::/7` / `fe80::/10`, `.local` and `.internal` names, and single-label
+  hostnames (a Docker Compose service name such as `actual_server`). A rejected URL
+  emits an `insecure_transport` security event at `high`.
+- This replaced a rule conditional on `NODE_ENV=production`, which was wrong in
+  both directions. Too strict for the deployment this project documents: the image
+  sets `ENV NODE_ENV=production` ([Dockerfile](Dockerfile)), so
+  `http://actual_server:5006` over the Compose network could not start, and
+  `.env.example` as shipped could not start either. Too lax where it mattered: a run
+  with `NODE_ENV` unset sent credentials in plaintext to any host on the internet
+  without comment. The host is what determines the exposure, so the host is what is
+  checked.
 - Certificate validation enforced (`rejectUnauthorized: true`).
 - TLS 1.2 minimum / TLS 1.3 maximum on the Ghostfolio agent
   ([src/ghostfolio.js](src/ghostfolio.js)).
@@ -277,13 +357,13 @@ push: false`, scans the loaded image, and only then logs in to the registry and
 | A01 Broken Access Control                    | ✅ PASS    | Minimal access model; no multi-user surface.                                                                         |
 | A02 Cryptographic Failures                   | ✅ PASS    | Secrets kept out of disk/logs; HTTPS + cert validation enforced.                                                     |
 | A03 Injection                                | ✅ PASS    | Joi validation on all inputs; cron expression validated.                                                             |
-| A04 Insecure Design                          | ✅ PASS    | Sequential single-flight egress, bounded retries, hard sync timeout, and audit trail in place.                       |
-| A05 Security Misconfiguration                | ✅ PASS    | Secure defaults; non-root execution; HTTPS forced in production.                                                     |
+| A04 Insecure Design                          | ✅ PASS    | Resolve-then-write ordering, read-back verification, bounded retries, hard sync timeout, audit trail.                |
+| A05 Security Misconfiguration                | ✅ PASS    | Secure defaults; non-root execution; plaintext HTTP refused for non-local hosts.                                     |
 | A06 Vulnerable & Outdated Components         | ✅ PASS    | Dependencies current; `npm audit` reports 0 vulnerabilities; blocking high-severity gate in CI.                      |
 | A07 Identification & Authentication Failures | 🟡 PARTIAL | Token auth with audit logging and length minimums; no token expiry/refresh (see below).                              |
 | A08 Software & Data Integrity Failures       | 🟡 PARTIAL | Base image pinned by digest; actions pinned by SHA; install scripts denied by default. No SBOM or image signing yet. |
 | A09 Security Logging & Monitoring Failures   | ✅ PASS    | Structured, sanitized logs with correlation IDs and audit events.                                                    |
-| A10 Server-Side Request Forgery (SSRF)       | ✅ PASS    | URL scheme/host validation; HTTPS enforced in production.                                                            |
+| A10 Server-Side Request Forgery (SSRF)       | ✅ PASS    | URL scheme/host validation; HTTPS required for every non-local host.                                                 |
 
 **Score: 8 / 10 PASS** (2 partial, no failures).
 
@@ -353,6 +433,13 @@ status, errors, and API endpoint URLs. Logs **do not** contain passwords,
 access tokens, account balances, or stack traces — and this holds in every
 environment, not only when `NODE_ENV=production`.
 
+That covers error messages too, which is why the balance guards report the limit
+rather than the value: "magnitude exceeds N minor units" names a constant,
+"stored a different balance than was sent for account X" names neither the value
+sent nor the value found. An error message ends up in `error.log` on a mounted
+volume like any other line, so a guard that quoted the balance it rejected would
+put balances in the log file by a side door.
+
 Credential redaction in `sanitizeError()` is defence in depth, not a licence to
 put secrets in messages. It removes the known secret values and the common
 patterns that carry them; a credential the application never learned the value of
@@ -395,11 +482,18 @@ rest are the operator's responsibility.
 - ✅ The health check verifies the scheduler is actually running.
 - ✅ Dependency install scripts are denied by default at image build time.
 - ✅ A minimum TLS version is enforced process-wide, covering both API legs.
+- ✅ Plaintext HTTP is refused for both API endpoints unless the host is one only a
+  local network can reach.
+- ✅ A run in which every mapped account reads zero writes nothing, and every write
+  is read back and compared against the value that was sent.
 - [ ] Secrets are stored in a secret manager, not committed `.env` files.
 - [ ] `ACTUAL_BUDGET_PASS` and `GHOSTFOLIO_TOKEN` are real credentials, not
       placeholders — the 8- and 16-character minimums catch empty and truncated
       values, not weak ones.
-- [ ] HTTPS is enforced for both API endpoints (required in production).
+- [ ] Every mapping in `config.json` declares the currency its Ghostfolio account
+      is actually denominated in, and maps a cash account rather than a brokerage
+      total (a Ghostfolio `balance` is cash; holdings are counted separately).
+- [ ] One `DRY_RUN=true` run has been made after the last `config.json` edit.
 - [ ] The published image tag in `docker-compose.yml` is the one you intend to
       run (it is pinned to a release, not `latest` — bump it deliberately).
 - [ ] Logs are aggregated and monitored.

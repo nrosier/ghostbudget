@@ -45,9 +45,9 @@ links only, and the code's own comments carry the reasoning.
 - **Package:** `joi`
 - **Implementation:** [src/utils/validation.js](src/utils/validation.js)
 - **Features:**
-  - Schema validation for `config.json` account mappings (`validateConfig`)
-  - Schema validation for environment variables, including URL scheme/host checks and an HTTPS requirement in production (`validateEnvironment`)
-  - Balance, factor, and account-name validation (`validateBalance`, `validateFactor`, `validateAccountName`); response-shape checks live at their point of use in [src/ghostfolio.js](src/ghostfolio.js)
+  - Schema validation for `config.json` account mappings (`validateConfig`), including a required ISO 4217 `currency` per mapping and a uniqueness constraint on `ghostfolioName`
+  - Schema validation for environment variables (`validateEnvironment`), plus `assertTransportSecurity`: plaintext `http://` is refused for any host outside a local network, in every environment
+  - Balance, factor, account-name and account-id validation (`validateBalance`, `validateFactor`, `validateAccountName`, `validateAccountId`); response-shape checks live at their point of use in [src/ghostfolio.js](src/ghostfolio.js)
   - Defense-in-depth rejection of obviously malicious account names (`<script`, `javascript:`, `on*=`). Names are treated as identifiers and serialized as JSON only — they are intentionally **not** HTML-escaped, so legitimate names containing `& < > " '` still match across APIs
   - Error sanitization that strips stack traces before logging (`sanitizeError`)
 - **Impact:** Rejects malformed input and prevents leaking sensitive data in logs
@@ -172,11 +172,29 @@ tests/                    # One suite per module above, plus scheduler supervisi
 1. ✅ Retry logic with exponential backoff and a capped delay
 2. ✅ TLS 1.2 floor set process-wide, with certificate validation
 3. ✅ Schema-based config and environment validation (Joi)
-4. ✅ HTTPS enforcement for external URLs in production
+4. ✅ Plaintext HTTP refused for any host outside a local network, in every environment
 5. ✅ Audit trail for authentication, balance updates, and security events
-6. ✅ Error sanitization (no stack traces or sensitive data in logs)
+6. ✅ Error sanitization (no stack traces, sensitive data, or balance values in logs)
 7. ✅ Non-root container user, read-only root filesystem, dropped capabilities
 8. ✅ Refusal to write inside protected data directories (`PROTECTED_DATA_DIRS`)
+
+---
+
+## 🛡️ Write Integrity
+
+The only field this job writes is `balance`, on accounts named in `config.json`.
+An incorrect balance is a worse outcome than a stale one, so the write path is
+built to refuse rather than guess. Implementation: [src/ghostfolio.js](src/ghostfolio.js).
+
+1. ✅ **Resolve everything, then write.** `syncAccountBalances` computes every intended write before sending the first one, so a check spanning the whole mapped set can exist
+2. ✅ **`config.json` read before authenticating** — a local mistake does not exchange a credential first
+3. ✅ **All-zero refusal.** One zero is a real balance and is written; every mapped account reading zero at once is what an unfinished budget sync looks like, and writes nothing at all
+4. ✅ **Ambiguity refused, not resolved by picking.** A name matching more than one account on either side fails that mapping (`exactlyOneNamed`); `Array.prototype.find()` used to send the balance to whichever the API listed first
+5. ✅ **Currency compared, never converted.** The required `currency` per mapping is checked against the Ghostfolio account; a mismatch fails that account and the run continues
+6. ✅ **Every write read back.** Ghostfolio's update response carries the stored account; a stored balance differing from the one sent by `BALANCE_EPSILON` or more fails that account (`verifyStoredBalance`)
+7. ✅ **Unchanged balances are not rewritten** — the cheapest way to not store a wrong number is to not write
+8. ✅ **Per-mapping failure isolation** — the accounts that could be synced were, and the run exits non-zero with a count
+9. ✅ **`DRY_RUN=true`** resolves and reports every mapping without sending a write
 
 ---
 
@@ -197,7 +215,7 @@ removable.
 
 ### Audit Events
 1. **Authentication** — success/failure per service (Actual Budget, Ghostfolio)
-2. **Balance updates** — per account, recording whether the value actually changed
+2. **Balance updates** — per account, recording whether the value actually changed and whether a request was sent (`written`, plus `dry_run` under `DRY_RUN`)
 3. **Sync operations** — started / completed / failed / skipped, with duration
 4. **Security events** — e.g. a rejected account name, a protected-path write
 5. **Validation failures** — environment and input validation
@@ -249,6 +267,7 @@ NODE_ENV=production      # development | production | test
 LOG_LEVEL=info           # error | warn | info | debug
 
 MAX_RETRIES=3            # 0–10
+DRY_RUN=false            # resolve and report every mapping, write nothing
 ```
 
 Operators who still have `CACHE_TTL_MINUTES` or `BATCH_SIZE` set do not need to
@@ -258,7 +277,14 @@ ignored rather than fatal.
 Account mappings live in `config.json` (see [config.json.example](config.json.example)),
 validated against the schema in [src/utils/validation.js](src/utils/validation.js).
 
-> **Note:** In production, both `ACTUAL_BUDGET_URL` and `GHOSTFOLIO_URL` must use HTTPS.
+> **Note:** both `ACTUAL_BUDGET_URL` and `GHOSTFOLIO_URL` must use `https://` unless
+> the host is one only a local network can reach (`localhost`, an RFC 1918 address, a
+> `.local`/`.internal` name, or a single-label name such as a Compose service). This
+> does not depend on `NODE_ENV`.
+
+> **Note:** each `config.json` mapping requires a `currency` field (ISO 4217). A
+> config written against an earlier version fails validation at startup, before
+> anything is written.
 
 ---
 
@@ -306,8 +332,10 @@ and reporting them together.
 2. **Retry, and nothing above it:** transient failures are worth retrying; a shared-state control that can refuse requests on another account's behalf is not appropriate for a run this short. The wall-clock backstop is the scheduler's `SYNC_TIMEOUT_MS`, escalating `SIGTERM` to `SIGKILL`.
 3. **Fail per account, report once:** a bad mapping fails its own account and the run raises a single error naming every failure, so one stale entry cannot hide the others.
 4. **Validation:** `joi` schemas centralize input rules; account names are validated as identifiers, not HTML. Response shapes are checked at their point of use, where the expected type is known.
-5. **Security by default:** HTTPS enforced in production; relaxed only for local development.
-6. **Prefer the standard library:** `crypto.randomUUID()` over a UUID package — same CSPRNG, one fewer dependency to install, audit and mock around.
+5. **The host decides the transport rule, not `NODE_ENV`:** plaintext is refused wherever the traffic could leave a local network, and accepted where it cannot. The previous rule was conditional on `NODE_ENV=production`, which made the documented Compose deployment unstartable (the image sets `NODE_ENV=production`) while letting a run with `NODE_ENV` unset send credentials in the clear to a remote host. What determines the exposure is the host.
+6. **Refusing beats guessing, on every write path:** ambiguous account names, a currency that disagrees, an all-zero read, a stored value that does not match what was sent — each of these ends in nothing being written rather than something plausible. The tool's output is a number the operator will treat as their bank balance, so an absent update is recoverable in a way a wrong one is not.
+7. **Balance values appear nowhere but the request body:** not in logs, not in audit records, and not in error messages — which is why the guards name the limit or the account instead of the value. `error.log` sits on a mounted volume and outlives the process.
+8. **Prefer the standard library:** `crypto.randomUUID()` over a UUID package — same CSPRNG, one fewer dependency to install, audit and mock around.
 
 ---
 
