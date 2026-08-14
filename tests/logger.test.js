@@ -138,8 +138,15 @@ describe('logger file transports', () => {
 describe('logger format', () => {
   it('stamps a correlation id and the service metadata on every record', () => {
     const logger = require('../src/logger');
+    const build = require('../src/config/version');
 
-    expect(logger.defaultMeta).toMatchObject({ service: 'ghostbudget' });
+    // The version comes from package.json via src/config/version.js. It was a
+    // literal '1.0.0' here, which could not tell two builds of one version apart.
+    expect(logger.defaultMeta).toMatchObject({
+      service: 'ghostbudget',
+      version: require('../package.json').version,
+    });
+    expect(logger.defaultMeta).toMatchObject(build.meta);
 
     const record = logger.format.transform({ level: 'info', message: 'hello' });
     expect(record.correlationId).toBeTruthy();

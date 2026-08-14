@@ -95,4 +95,37 @@ ENV NODE_ENV=production \
     LOG_LEVEL=info \
     ACTUAL_BUDGET_DATA_DIR=/actual-budget
 
+# Build identity, stamped in because it cannot be derived at runtime: .dockerignore
+# excludes .git/, and there is no git binary in the image — the layer above deletes
+# even the package managers. src/config/version.js turns these into
+# `1.0.0+20260814T140004Z.079da7b` and refuses anything that is not a hex object
+# name, so a wrong value reads as absent rather than naming a tree the code did not
+# come from.
+#
+# Both default to empty, so a plain `docker build .` still produces a working image;
+# it reports itself as `1.0.0+dev`. To stamp a local build:
+#
+#   docker build \
+#     --build-arg GHOSTBUDGET_COMMIT="$(git describe --always --dirty)" \
+#     --build-arg GHOSTBUDGET_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
+#
+# Declared here, after every COPY and RUN, so a new commit invalidates no cached
+# layer: everything below this point is image metadata.
+ARG GHOSTBUDGET_COMMIT=""
+ARG GHOSTBUDGET_BUILT_AT=""
+ENV GHOSTBUDGET_COMMIT=$GHOSTBUDGET_COMMIT \
+    GHOSTBUDGET_BUILT_AT=$GHOSTBUDGET_BUILT_AT
+
+# OCI annotations, so `docker inspect` answers "what is this and when was it built"
+# without a running container. `revision` takes the full object name rather than the
+# short one the logs use, which is what the spec asks for. No
+# `org.opencontainers.image.version`: it would be a second copy of package.json's
+# version, which is in the image and is the source the code reads.
+LABEL org.opencontainers.image.title="ghostbudget" \
+      org.opencontainers.image.description="Syncs Actual Budget account balances to Ghostfolio" \
+      org.opencontainers.image.source="https://github.com/nrosier/ghostbudget" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision="$GHOSTBUDGET_COMMIT" \
+      org.opencontainers.image.created="$GHOSTBUDGET_BUILT_AT"
+
 ENTRYPOINT ["/sbin/tini", "--", "node", "/app/src/scheduler.js"]

@@ -158,6 +158,16 @@ repository to stay informed.
   timestamp duplicated winston's and nothing ever read the id, so both are gone —
   and the `uuid` dependency with them, since `crypto.randomUUID()` produces the
   correlation ID.
+- **Every record identifies the build that wrote it**: `version` from
+  `package.json` and the `commit` it was built from, with the full
+  `1.0.0+20260814T140004Z.079da7b` and `built_at` on the startup record
+  ([src/config/version.js](src/config/version.js)). `version` was previously the
+  literal `'1.0.0'` in the logger, which could not distinguish two builds of one
+  version — so a log establishing what the tool did could not establish which code
+  did it. The commit and build time are stamped in at image build time, because
+  `.dockerignore` excludes `.git/` and the image has no git binary. A value that is
+  not a hex object name is discarded rather than recorded: an absent commit is a
+  gap, a wrong one is a false attribution.
 - Balance-update events record **whether the balance actually changed**, compared
   against the value Ghostfolio already held, and **whether a request was actually
   sent** (`written`, plus `dry_run` under `DRY_RUN`). `changed` was a hardcoded

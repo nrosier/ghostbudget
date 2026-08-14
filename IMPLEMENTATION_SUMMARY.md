@@ -156,7 +156,8 @@ src/
 ├── logger.js             # Winston logger with correlation IDs
 ├── config/
 │   ├── constants.js      # Centralized configuration constants
-│   └── tls.js            # Process-wide TLS version floor
+│   ├── tls.js            # Process-wide TLS version floor
+│   └── version.js        # Build identity: version, commit, build time
 └── utils/
     ├── audit.js          # Security audit logging
     ├── exit.js           # Flush log transports before exiting
@@ -223,7 +224,7 @@ removable.
 ### Log Enhancements
 1. **Correlation ID** — one per process, added to every log line
 2. **Structured JSON** — timestamped, machine-parseable
-3. **Service metadata** — service name and version
+3. **Service metadata** — service name, version and the commit the build was made from. The startup record adds the full `1.0.0+20260814T140004Z.079da7b` and its `built_at`; the format is SemVer 2.0.0 build metadata, so it still compares as `1.0.0`. `version` used to be a literal `'1.0.0'` in the logger, which could not tell two builds of one version apart ([src/config/version.js](src/config/version.js))
 4. **File rotation** — size-capped `combined.log` and `error.log`
 
 ---

@@ -4,6 +4,7 @@ require('dotenv').config({ quiet: true });
 const { getAccountBalances } = require('./actualBudget');
 const ghostfolio = require('./ghostfolio');
 const logger = require('./logger');
+const build = require('./config/version');
 const AuditLogger = require('./utils/audit');
 const { flushLogsAndExit } = require('./utils/exit');
 const { errorMessageOf, sanitizeError } = require('./utils/validation');
@@ -60,7 +61,11 @@ async function sync() {
   // already puts one on every record, so passing another only produced two fields
   // that had to agree.
   try {
-    logger.info('Starting sync process...');
+    // The build fields ride on the record this already wrote. Every other record
+    // carries the version and commit from the logger's defaultMeta; this is the one
+    // that says when the build was made, so it is worth one line per run rather
+    // than a field on all of them.
+    logger.info('Starting sync process...', build.startup);
     AuditLogger.logSync('started');
 
     // Get balances from Actual Budget

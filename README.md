@@ -189,6 +189,55 @@ Both files rotate at 10 MB, keeping 5 generations. Log files never contain
 passwords, access tokens, account balances, or stack traces — in any environment.
 They do contain account names, which are treated as non-sensitive identifiers.
 
+### Which build wrote a log line
+
+Every record carries `version` (from `package.json`) and `commit`, and the record
+each run writes at startup adds the full build string and the build time:
+
+```json
+{
+  "message": "Starting sync process...",
+  "version": "1.0.0",
+  "commit": "079da7b",
+  "build": "1.0.0+20260814T140004Z.079da7b",
+  "built_at": "2026-08-14T14:00:04Z"
+}
+```
+
+`build` is [SemVer 2.0.0 build metadata](https://semver.org/#spec-item-10): the part
+after the `+` carries no precedence, so this is still version `1.0.0` to anything
+that compares versions, while the string itself says which commit it is and when it
+was built. The timestamp is in ISO 8601 _basic_ format there because build metadata
+allows only `[0-9A-Za-z-]`, so the colons of `14:00:04` would make it invalid;
+`built_at` is the same instant in the extended format.
+
+The commit and the build time cannot be worked out at runtime — `.git/` is excluded
+from the image and there is no git binary in it — so the image build stamps them in
+as two build arguments:
+
+```bash
+docker build \
+  --build-arg GHOSTBUDGET_COMMIT="$(git describe --always --dirty)" \
+  --build-arg GHOSTBUDGET_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
+```
+
+These are inputs to `docker build`, **not** settings to put in `.env` — a value left
+in an environment would outlive the build it described. The published images set
+both from CI, and the same values become the `org.opencontainers.image.revision` and
+`.created` labels, so `docker inspect` answers the question without a running
+container:
+
+```bash
+docker inspect --format '{{json .Config.Labels}}' niqck/ghostbudget:latest
+```
+
+Anything unstamped is reported as such rather than guessed. A plain `docker build`
+or a bare `npm run sync` yields `1.0.0+dev` and no `commit` field; a value that is
+not a hex object name is discarded rather than logged, because a wrong commit names
+a tree the running code did not come from. A build made from a modified working
+tree — `git describe --dirty` — is marked `1.0.0+20260814T140004Z.079da7b.dirty`, with
+`"dirty": true` on every record.
+
 ## Automated Execution
 
 ### Using Docker (recommended)

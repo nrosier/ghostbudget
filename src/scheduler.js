@@ -36,6 +36,7 @@ const { Cron } = require('croner');
 const logger = require('./logger');
 const AuditLogger = require('./utils/audit');
 const constants = require('./config/constants');
+const build = require('./config/version');
 const { flushLogsAndExit } = require('./utils/exit');
 const { validateDataDir, sanitizeError } = require('./utils/validation');
 
@@ -402,6 +403,7 @@ function main() {
   // Print the next few run times so a mistyped schedule is obvious in the
   // startup log rather than only after a night of nothing happening.
   logger.info('GhostBudget scheduler started', {
+    ...build.startup,
     schedule: schedule.pattern,
     node_version: process.version,
     uid: typeof process.getuid === 'function' ? process.getuid() : 'unknown',

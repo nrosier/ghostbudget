@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const winston = require('winston');
 const constants = require('./config/constants');
+const build = require('./config/version');
 
 // Correlation ID for this process instance. Node's own randomUUID rather than the
 // `uuid` package: it is the same v4 UUID from the same CSPRNG, with one fewer
@@ -80,7 +81,11 @@ const logger = winston.createLogger({
     })(),
     winston.format.json()
   ),
-  defaultMeta: { service: 'ghostbudget', version: '1.0.0' },
+  // `version` used to be the literal '1.0.0', a second copy of package.json's that
+  // could not tell two builds of the same version apart. It now comes from
+  // package.json itself, alongside the commit the build was made from — see
+  // src/config/version.js for the format and why the build time is not here.
+  defaultMeta: { service: 'ghostbudget', ...build.meta },
   transports: transports,
 });
 

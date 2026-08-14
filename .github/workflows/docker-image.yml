@@ -15,6 +15,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # The image cannot work this out for itself: .dockerignore excludes .git/ and
+      # the image has no git binary, so the commit and the build time are stamped in
+      # as build args. RFC 3339 in UTC, which is what the OCI `created` annotation
+      # and src/config/version.js both expect.
+      - name: Stamp the build
+        id: stamp
+        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       # Build into the local daemon rather than straight to the registry. The
       # previous workflow pushed :latest in a single step with no scan, so the
       # Docker Security Scan job in security.yml — which builds its own throwaway
@@ -27,6 +35,9 @@ jobs:
           push: false
           no-cache: true
           tags: ghostbudget:candidate
+          build-args: |
+            GHOSTBUDGET_COMMIT=${{ github.sha }}
+            GHOSTBUDGET_BUILT_AT=${{ steps.stamp.outputs.built_at }}
 
       - name: Scan image before pushing
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

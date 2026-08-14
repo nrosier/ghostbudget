@@ -58,9 +58,12 @@ module.exports = {
       functions: 100,
       lines: 100,
     },
+    // 97.22 is the ceiling: the remaining branch is constants.js's
+    // `GHOSTBUDGET_HEALTH_FILE ||` fallback, which every test sets so the suites do
+    // not fight over one fixed path.
     './src/config/': {
       statements: 100,
-      branches: 75,
+      branches: 97,
       functions: 100,
       lines: 100,
     },
