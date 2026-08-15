@@ -48,6 +48,37 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
 
+      # An SBOM for the image that is about to be pushed, from the same local image the
+      # gate above just passed — so what is inventoried is exactly what ships, and an
+      # image that failed the gate never gets an SBOM published for it.
+      #
+      # This is a separate step rather than build-push-action's native `sbom: true`
+      # because that only attaches an attestation when buildx pushes the manifest
+      # itself. This workflow deliberately builds with `load: true` and pushes with
+      # plain `docker push` further down, so that the scan finishes before registry
+      # credentials enter the environment. A standalone artifact is what fits that
+      # ordering; keeping the ordering matters more than having the SBOM in-manifest.
+      #
+      # CycloneDX rather than SPDX: Trivy emits it natively, so no second tool is
+      # pinned, and it is what `trivy sbom` can be pointed back at to re-scan the
+      # inventory later without the image.
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: 'ghostbudget:candidate'
+          scan-type: 'image'
+          format: 'cyclonedx'
+          scanners: 'vuln'
+          output: 'sbom.cyclonedx.json'
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cyclonedx.json
+          if-no-files-found: error
+          retention-days: 90
+
       # Login happens after the scan, so registry credentials are not present in
       # the environment while third-party build and scan code is running.
       - name: Log in to Docker Hub

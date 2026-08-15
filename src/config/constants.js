@@ -106,6 +106,13 @@ module.exports = {
   // integers, so a misread field or a units mix-up shows up as an absurd
   // magnitude. Bounding it here means such a value fails the *fetch*, before any
   // of it reaches Ghostfolio.
+  //
+  // Coupled to MAX_BALANCE_FACTOR below: toStoredBalance in ghostfolio.js computes
+  // Math.round(minorUnits * factor), and Math.round is only exact while its argument
+  // stays inside the integer-exact range of a double. 1e12 * 1000 = 1e15, under
+  // Number.MAX_SAFE_INTEGER (~9.007e15). Raising *either* constant past that product
+  // does not raise an error — it silently rounds large balances to the wrong cent.
+  // tests/validation.test.js asserts the product, so a change here fails there.
   MAX_BALANCE_MINOR_UNITS: 1e12,
   // Balances are compared in major units after rounding to cents, so two values
   // closer than half a cent are the same stored value. Used to decide whether a
@@ -120,5 +127,9 @@ module.exports = {
   // A per-account factor converts units (cents to euros, shares to a valuation).
   // Anything past this is a typo — an extra zero on a balance is a number a
   // financial API should not be asked to store.
+  //
+  // Coupled to MAX_BALANCE_MINOR_UNITS above: their product has to stay inside the
+  // integer-exact range of a double, or Math.round in toStoredBalance loses cents
+  // without failing. Read that comment before raising this.
   MAX_BALANCE_FACTOR: 1000,
 };

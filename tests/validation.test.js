@@ -168,6 +168,24 @@ describe('validateFactor', () => {
       expect(() => validateFactor(value)).toThrow(/must be a finite number/);
     }
   });
+
+  it('keeps its own limit multiplied by the balance limit inside exact-integer range', () => {
+    // The two limits are coupled, and nothing at runtime notices when they stop being
+    // safe. toStoredBalance computes Math.round(minorUnits * factor), which is exact
+    // only while the product stays inside a double's integer-exact range. Both
+    // validators pass their maxima, so the largest product either can produce is this
+    // one — and past MAX_SAFE_INTEGER, Math.round starts returning a neighbouring
+    // integer instead of throwing. A balance would be stored a cent or more out with
+    // every guard in this file reporting success.
+    //
+    // So the assertion is on the product, not on either constant: raising one is fine,
+    // raising it far enough that the two together leave exact-integer range is not.
+    const largestProduct = constants.MAX_BALANCE_MINOR_UNITS * constants.MAX_BALANCE_FACTOR;
+
+    expect(largestProduct).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+    // Exactness itself, rather than the bound that implies it.
+    expect(Math.round(largestProduct)).toBe(largestProduct);
+  });
 });
 
 describe('validateAccountName', () => {

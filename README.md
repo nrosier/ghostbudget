@@ -15,8 +15,12 @@ GhostBudget is a Node.js application that synchronizes account balances between 
 
 ## Prerequisites
 
-- Node.js 18 or newer, and npm 9 or newer (enforced by `engines` in
-  [package.json](package.json))
+- Node.js 24 or newer, and npm 11 or newer. This is the version the container ships
+  and the version CI tests, and it is enforced rather than suggested: `engines` in
+  [package.json](package.json) sets the floor and `engine-strict=true` in
+  [.npmrc](.npmrc) makes npm refuse the install below it instead of warning and
+  continuing. `.nvmrc` names the same version for `nvm use`. The bare-metal cron and
+  systemd setups below need it too — they run the same code.
 - An Actual Budget server instance
 - A Ghostfolio instance
 - Access tokens/credentials for both services
@@ -412,7 +416,8 @@ no HTTP endpoint. `src/scheduler.js` is the container's long-lived process and f
 ```bash
 npm run lint            # ESLint, including eslint-plugin-security; warnings fail
 npm run lint:fix        # …and fix what can be fixed automatically
-npm run format          # Prettier
+npm run format          # Prettier, rewriting files
+npm run format:check    # Prettier, reporting instead of rewriting — this is what CI runs
 npm test                # Jest
 npm run test:coverage   # Jest with the coverage thresholds enforced
 ```
@@ -420,6 +425,12 @@ npm run test:coverage   # Jest with the coverage thresholds enforced
 CI runs `npm run test:coverage` rather than `npm test`, because Jest's coverage
 thresholds only engage when coverage is collected. If you add a module, expect the
 thresholds in [jest.config.js](jest.config.js) to hold you to covering it.
+
+CI also runs `format:check`. ESLint already enforces Prettier on `.js` via the
+`prettier/prettier` rule, but `.json` and `.md` had no check anywhere — `format` only
+rewrites, so their formatting held only for as long as everyone remembered to run it.
+`.yml` is deliberately outside the glob: the workflow files are read closely during
+security review and reformatting them would put whitespace churn in that history.
 
 `npm run lint` uses `--max-warnings=0`. `eslint-plugin-security` reports at warning
 level, so without that flag its findings print and the build passes anyway.

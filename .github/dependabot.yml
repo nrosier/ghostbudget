@@ -1,3 +1,13 @@
+# Three ecosystems are watched, because three separate things reach production.
+#
+# For a long time only "npm" was listed here, which meant the base-image digest in the
+# Dockerfile and every action version in .github/workflows had no automated update path
+# at all — they were current only for as long as someone happened to check. A pinned
+# digest and a pinned action SHA do not stop being pinned when they go stale; they just
+# stop being the version anyone reviewed. Both are now watched.
+#
+# Only npm updates are eligible for auto-merge, and that is enforced in
+# dependabot-auto-merge.yml rather than here. See the comment there for why.
 version: 2
 updates:
   - package-ecosystem: "npm"
@@ -54,3 +64,69 @@ updates:
       major-updates:
         update-types:
           - "major"
+
+  # GitHub Actions. Every action referenced by a workflow, whether it is pinned to a
+  # major tag (the GitHub-owned ones) or to a commit SHA with a version comment (the
+  # third-party ones) — Dependabot updates the SHA and the trailing comment together,
+  # which is the part that is easy to get wrong by hand.
+  #
+  # This matters more than an npm update does: workflow code runs in CI with the scopes
+  # that job was granted, and docker-image.yml holds the registry credentials that
+  # publish :latest. No action update is auto-merged.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+    open-pull-requests-limit: 5
+
+    pull-request-branch-name:
+      separator: "-"
+
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+    # No dependency-type split here: actions have no production/development
+    # distinction, so minor and patch are grouped together and majors separately.
+    groups:
+      actions:
+        update-types:
+          - "minor"
+          - "patch"
+      actions-major:
+        update-types:
+          - "major"
+
+  # The Dockerfile base image. `node:lts-alpine` is pinned by digest, so this is the
+  # only thing that refreshes that pin — and the digest defines the whole deployed
+  # artifact, kernel-adjacent libraries included. Never auto-merged.
+  #
+  # Dependabot rewrites the digest but not the comment above it, which records the Node
+  # and Alpine versions the digest resolved to and the date. Re-resolve those when
+  # reviewing the PR; the command is in the Dockerfile.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+
+    labels:
+      - "dependencies"
+      - "docker"
+
+    open-pull-requests-limit: 5
+
+    pull-request-branch-name:
+      separator: "-"
+
+    commit-message:
+      prefix: "chore"
+      include: "scope"

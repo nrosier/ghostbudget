@@ -23,7 +23,10 @@ RUN apk upgrade --no-cache && \
 
 WORKDIR /app
 
-COPY package*.json ./
+# .npmrc comes along because it carries engine-strict=true: the image build is then held
+# to the same Node floor as a developer's install rather than being the one place that
+# floor is not checked. It must not be added to .dockerignore, or this COPY fails.
+COPY package*.json .npmrc ./
 
 # Install dependencies, denying install scripts by default.
 #

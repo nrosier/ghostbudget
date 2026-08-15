@@ -1,10 +1,19 @@
 name: Dependabot Auto-merge
 
-# Only PATCH-level updates to DIRECT dependencies merge without human review.
+# Only PATCH-level updates to DIRECT npm dependencies merge without human review.
 # Minor updates, major updates, and every transitive (indirect) update stay open
 # for a person to look at. This image holds Actual Budget and Ghostfolio
 # credentials, so an unreviewed transitive dependency must not be able to reach
 # production — main pushes publish :latest, which deployments consume.
+#
+# The npm restriction is load-bearing, not decoration. dependabot.yml also watches
+# github-actions and docker, and Dependabot reports both of those as
+# `dependency-type: direct` — so without the ecosystem check, a patch bump of a
+# workflow action or of the base-image digest would satisfy the conditions below and
+# merge unreviewed. Neither passes through the application's dependency tree on its
+# way to production: action code runs in CI with that job's scopes, including the job
+# holding the registry credentials, and the digest *is* the deployed artifact. Those
+# two always wait for a person.
 on:
   pull_request_target:
 
@@ -36,20 +45,26 @@ jobs:
 
       - name: Report decision
         run: |
+          echo "Ecosystem:    $PACKAGE_ECOSYSTEM"
           echo "Dependency:   $DEPENDENCY_NAMES"
           echo "Update type:  $UPDATE_TYPE"
           echo "Dep type:     $DEPENDENCY_TYPE"
           echo "Eligible:     $ELIGIBLE"
         env:
+          PACKAGE_ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
           DEPENDENCY_NAMES: ${{ steps.metadata.outputs.dependency-names }}
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           DEPENDENCY_TYPE: ${{ steps.metadata.outputs.dependency-type }}
-          ELIGIBLE: ${{ steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
+          ELIGIBLE: ${{ steps.metadata.outputs.package-ecosystem == 'npm' && steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
 
-      # dependency-type is one of: direct:production, direct:development, indirect.
-      # Requiring the "direct:" prefix is what excludes transitive updates.
+      # For npm, dependency-type is one of direct:production, direct:development or
+      # indirect, so matching the "direct" prefix is what excludes transitive updates.
+      #
+      # Note that startsWith matches a bare "direct" too, which is what the other two
+      # ecosystems report — so this condition alone does not exclude them. The
+      # package-ecosystem check is what does, and it is not redundant with this one.
       - name: Approve
-        if: ${{ steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
+        if: ${{ steps.metadata.outputs.package-ecosystem == 'npm' && steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
         run: gh pr review --approve "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -58,7 +73,7 @@ jobs:
       # --auto still requires all required status checks (lint, test, security) to
       # pass before GitHub performs the merge.
       - name: Enable auto-merge
-        if: ${{ steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
+        if: ${{ steps.metadata.outputs.package-ecosystem == 'npm' && steps.metadata.outputs.update-type == 'version-update:semver-patch' && startsWith(steps.metadata.outputs.dependency-type, 'direct') }}
         run: gh pr merge --auto --merge "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

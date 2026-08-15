@@ -448,18 +448,35 @@ push: false`, scans the loaded image, and only then logs in to the registry and
 
 ## Dependency Security
 
-`npm audit` reports **0 known vulnerabilities**. Production dependencies are
-kept current (managed via Dependabot):
+`npm audit` reports **0 known vulnerabilities**, and `npm audit signatures` verifies a
+registry signature for every package in the installed tree. Production dependencies are
+kept current by Dependabot:
 
 | Package           | Version |
 | ----------------- | ------- |
-| `@actual-app/api` | ^26.8.1 |
+| `@actual-app/api` | 26.8.1  |
 | `axios`           | 1.19.0  |
-| `axios-retry`     | ^4.5.0  |
+| `axios-retry`     | 4.5.0   |
 | `croner`          | 10.0.1  |
 | `dotenv`          | 17.4.2  |
 | `joi`             | 18.2.3  |
 | `winston`         | 3.19.0  |
+
+Every version is exact rather than a `^` range. With a committed lockfile this changes
+nothing about what `npm ci` installs; what it changes is that an upgrade cannot arrive as
+a side effect of someone running `npm install`. Each one is a Dependabot PR that was
+reviewed, which is the posture this repository takes with a process that moves account
+balances.
+
+[dependabot.yml](.github/dependabot.yml) watches three ecosystems, because three separate
+things reach production: `npm`, `github-actions` (workflow code runs in CI with that job's
+scopes, including the job that holds the registry credentials) and `docker` (the
+base-image digest _is_ the deployed artifact). Only npm updates are eligible for
+auto-merge, and only patch-level updates of direct dependencies at that — the ecosystem
+check is enforced in
+[dependabot-auto-merge.yml](.github/workflows/dependabot-auto-merge.yml), not left to the
+`dependency-type` metadata, which reports both of the other two ecosystems as `direct`
+and would otherwise let them through.
 
 `opossum`, `rate-limiter-flexible` and `uuid` were direct production dependencies
 and no longer are — the first two because the controls they provided could not
@@ -497,11 +514,18 @@ scope them to the minimum permissions required.
 
 ### Base image pinning
 
-The [Dockerfile](Dockerfile) pins `node:lts-alpine` to a `sha256` digest. This
-makes builds reproducible, but it also means base-image security updates are
-**not** picked up automatically: the digest has to be refreshed deliberately. The
-Dockerfile records the command that resolves a new one. Trivy runs daily in CI
-against the built image, which is what surfaces the need to update.
+The [Dockerfile](Dockerfile) pins `node:lts-alpine` to a `sha256` digest. This makes
+builds reproducible, but it also means base-image security updates are **not** picked up
+by the tag moving: the digest has to be refreshed deliberately. Two things drive that.
+Trivy runs daily in CI against the built image, which surfaces the need; and
+[dependabot.yml](.github/dependabot.yml) watches the `docker` ecosystem, which opens the
+PR that does it. The Dockerfile also records the command that resolves a new digest by
+hand.
+
+A digest bump is never auto-merged, whatever its semver classification — the digest is
+the deployed artifact, so a person reviews it. Dependabot rewrites the digest but not the
+comment above it, which records the Node and Alpine versions it resolved to; re-resolve
+those when reviewing the PR.
 
 ### What logs do and do not contain
 
@@ -529,9 +553,14 @@ to them accordingly.
 ## Remaining Improvements (Low Priority)
 
 1. **Token lifecycle management** — expiration checks and refresh handling.
-2. **Supply-chain hardening** — generate an SBOM and sign the container image.
-   (Base-image digest pinning and restricting Dependabot auto-merge to
-   patch-level updates of direct dependencies are done.)
+2. **Supply-chain hardening** — sign the container image. Cosign needs OIDC setup and a
+   key-retention policy, which is a decision rather than a patch, so it is still open.
+   (Base-image digest pinning, restricting Dependabot auto-merge to patch-level updates
+   of direct **npm** dependencies, Dependabot coverage of the `docker` and
+   `github-actions` ecosystems, and a CycloneDX SBOM published per build are done — see
+   [docker-image.yml](.github/workflows/docker-image.yml). The SBOM is generated from the
+   same local image the pre-push Trivy gate passed, so what is inventoried is what ships
+   and a rejected image never gets one.)
 3. **Enhanced monitoring** — metrics/alerting on repeated auth failures and
    suspicious activity; optional syslog/HTTP log transport.
 4. **Expanded security testing** — integration/fuzz tests and SAST (e.g. Snyk,
