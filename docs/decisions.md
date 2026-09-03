@@ -597,28 +597,41 @@ not persisted, and every run started over.
 
 ## Tooling
 
-### Renovate replaced Dependabot's version updates, not its security updates
+### Renovate replaced Dependabot, and took a privileged workflow with it
 
-`renovate.json`, `.github/workflows/dependabot-auto-merge.yml`
+`renovate.json`
 
 Two bots watching the same manifests open two PRs per update, so `.github/dependabot.yml`
-went when `renovate.json` arrived. What did _not_ go is Dependabot security updates: those
-are a repository setting rather than a config file, so removing the file did not disable
-them, and `dependabot-auto-merge.yml` is still the thing that reviews them — which is why
-its npm-only gate stayed, and why Renovate's own `vulnerabilityAlerts` is explicitly
-disabled. Enabling both would duplicate exactly the PRs that matter most.
+went when `renovate.json` arrived. Dependabot _security_ updates were kept at first, since
+those are a repository setting rather than a config file and so survived the file's removal
+— but keeping them meant keeping `.github/workflows/dependabot-auto-merge.yml`, and that is
+what settled it.
 
-The auto-merge policy is now stated twice, once per bot, and deliberately: the workflow's
-`package-ecosystem == 'npm'` clause and `renovate.json`'s `automerge: false` on the
-`dockerfile` and `github-actions` managers say the same thing about the same risk. Neither
-of those two reaches production through the application's dependency tree — action code
-runs in CI with that job's scopes, and the digest is the deployed artifact — so both configs
-name the exclusion rather than relying on no rule having matched.
+That workflow ran on `pull_request_target` and requested `contents: write` and
+`pull-requests: write` in order to approve and merge. It was written carefully — no checkout
+of PR head, the author gated on `dependabot[bot]`, and a `package-ecosystem == 'npm'` clause
+that had to be added in all three expression sites because Dependabot reports github-actions
+and docker updates as a bare `direct`, which `startsWith(…, 'direct')` does not exclude.
+Renovate's `platformAutomerge` reaches the same outcome by handing the merge to GitHub, with
+no workflow, no elevated scopes and no `pull_request_target`. A privileged workflow removed
+is worth more than the integration it served, so both went.
 
-`minimumReleaseAge: 3 days` on npm has no Dependabot equivalent, and is the one control
-here that is new rather than ported. The supply-chain pattern it defends against is a
-compromised release that is published, installed by everything that updates within the
-hour, and yanked the same day.
+The policy it enforced is intact in `renovate.json`, and stated rather than implied:
+`automerge: false` appears explicitly on the `dockerfile` and `github-actions` managers
+instead of relying on no rule having matched them. Neither reaches production through the
+application's dependency tree — action code runs in CI with that job's scopes, and the
+digest is the deployed artifact.
+
+Two controls have no Dependabot equivalent and are new rather than ported.
+`minimumReleaseAge: 3 days` on npm defends against the supply-chain pattern where a
+compromised release is published, installed by everything that updates within the hour, and
+yanked the same day; it is explicitly lifted for `vulnerabilityAlerts`, which exist to fix
+old versions rather than adopt new ones. And `osvVulnerabilityAlerts` widens detection past
+GitHub's own advisory database, which is what makes dropping Dependabot's security updates a
+change of supplier rather than a loss of coverage.
+
+The one thing this cannot do from a config file: Dependabot security updates have to be
+turned off in the repository settings, or every security PR arrives twice.
 
 ### ESLint's recommended rules were never running
 

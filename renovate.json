@@ -2,14 +2,16 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", ":semanticCommitTypeAll(chore)"],
   "description": [
-    "Renovate owns version updates for all three things that reach production: the npm",
-    "tree, the GitHub Actions the workflows run, and the Dockerfile base-image digest.",
-    "It replaced .github/dependabot.yml rather than joining it — two bots watching the",
-    "same manifests open two PRs per update.",
-    "Dependabot still owns *security* updates. Those are a repository setting rather than",
-    "a config file, so removing dependabot.yml did not disable them, and they keep",
-    "flowing through the npm-only gate in .github/workflows/dependabot-auto-merge.yml.",
-    "vulnerabilityAlerts is therefore disabled below: enabling it would duplicate them."
+    "The only dependency bot on this repository. It owns both version and security",
+    "updates for all three things that reach production: the npm tree, the GitHub Actions",
+    "the workflows run, and the Dockerfile base-image digest.",
+    "Dependabot is gone entirely — its version updates were redundant with this file, and",
+    "keeping its security updates meant keeping a pull_request_target workflow that held",
+    "contents: write and pull-requests: write in order to auto-merge them. Removing a",
+    "privileged workflow is worth more than the integration was.",
+    "Turn Dependabot security updates OFF in the repository settings (Settings → Code",
+    "security). Left on, they duplicate every PR vulnerabilityAlerts below opens, and",
+    "nothing auto-merges them any more."
   ],
   "timezone": "UTC",
   "schedule": ["after 8am and before 10am on monday"],
@@ -18,9 +20,15 @@
   "prHourlyLimit": 4,
   "rebaseWhen": "conflicted",
   "internalChecksFilter": "strict",
+  "osvVulnerabilityAlerts": true,
+  "transitiveRemediation": true,
   "vulnerabilityAlerts": {
-    "enabled": false,
-    "description": "Owned by Dependabot security updates. See the note at the top of this file."
+    "enabled": true,
+    "description": "Security updates, and the one path that ignores the schedule and the release-age hold above — a known-exploitable version is not something to sit on until Monday, and the hold exists to slow unvetted *new* releases rather than fixes for old ones. Still never automerged: a security fix is frequently a minor or major bump, which is exactly the shape this repository reviews by hand. osvVulnerabilityAlerts widens detection beyond GitHub's own advisories, and transitiveRemediation lets a fix land as a lockfile-only bump when the vulnerable package is not a direct dependency.",
+    "labels": ["dependencies", "security"],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null,
+    "automerge": false
   },
   "lockFileMaintenance": {
     "enabled": false,
@@ -52,7 +60,7 @@
       "groupName": "development dependencies"
     },
     {
-      "description": "The only automerge in this config: a patch update to a direct npm dependency, which is the same policy dependabot-auto-merge.yml enforces for Dependabot's own PRs. platformAutomerge hands the merge to GitHub, so the required lint, test and security checks still have to pass first.",
+      "description": "The only automerge in this config, and the same policy the removed dependabot-auto-merge.yml workflow enforced: a patch update to a direct npm dependency, nothing else. platformAutomerge hands the merge to GitHub, so the required lint, test and security checks still have to pass first — and it needs no workflow and no elevated token, which is why that workflow could go.",
       "matchManagers": ["npm"],
       "matchDepTypes": ["dependencies", "devDependencies"],
       "matchUpdateTypes": ["patch"],

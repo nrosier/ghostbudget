@@ -435,10 +435,13 @@ skips its onboarding PR and goes straight to opening dependency PRs, and the
 It watches npm, the GitHub Actions the workflows use, and the Dockerfile base-image
 digest. Only patch updates to direct npm dependencies auto-merge, and only after the
 required checks pass; everything else waits for review. New npm releases are held for
-three days before being offered. Dependabot still handles security updates — those are a
-repository setting rather than a config file — which is why
-[dependabot-auto-merge.yml](.github/workflows/dependabot-auto-merge.yml) is still here.
-See [SECURITY.md](SECURITY.md#dependency-security) for why the split is that way round.
+three days before being offered — security fixes excepted, which open immediately and are
+never auto-merged.
+
+Renovate is the **only** dependency bot here. If you are setting this repository up
+yourself, turn **Dependabot security updates off** under Settings → Code security:
+Renovate raises those PRs now, so leaving Dependabot enabled just duplicates them. See
+[SECURITY.md](SECURITY.md#dependency-security) for why there is one bot rather than two.
 
 ### Checks
 

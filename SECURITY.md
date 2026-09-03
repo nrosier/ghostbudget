@@ -497,20 +497,35 @@ digest carry an explicit `automerge: false` rather than relying on no rule havin
 them. `platformAutomerge` hands the merge to GitHub, so the required lint, test and
 security checks still gate it.
 
-Renovate replaced `.github/dependabot.yml` rather than joining it — two bots watching the
-same manifests open two PRs per update. Dependabot still owns **security** updates, which
-are a repository setting rather than a config file and so survived that removal; those
-keep flowing through the npm-only gate in
-[dependabot-auto-merge.yml](.github/workflows/dependabot-auto-merge.yml), whose ecosystem
-check is not left to the `dependency-type` metadata — that reports both of the other two
-ecosystems as `direct` and would otherwise let them through. Renovate's own
-`vulnerabilityAlerts` is disabled for exactly that reason: enabling it would duplicate
-those PRs.
+Renovate is the only dependency bot on this repository, and that is the point rather than
+a convenience. It replaced `.github/dependabot.yml` because two bots watching the same
+manifests open two PRs per update; it then replaced Dependabot's **security** updates as
+well, because keeping those meant keeping
+`.github/workflows/dependabot-auto-merge.yml` — a `pull_request_target` workflow holding
+`contents: write` and `pull-requests: write` in order to merge them. Renovate's
+`platformAutomerge` hands the merge to GitHub instead, so it needs no workflow and no
+elevated token. Deleting a privileged workflow is worth more here than the integration
+was, and the auto-merge policy it enforced survives intact in
+[renovate.json](renovate.json): patch updates to direct npm dependencies only, with
+`automerge: false` stated explicitly on the `dockerfile` and `github-actions` managers
+rather than left to the absence of a matching rule.
 
-One control Renovate adds that Dependabot had no equivalent for: `minimumReleaseAge` holds
-a new npm release for three days before offering it. The npm supply-chain pattern this
-defends against is a compromised version that is published, installed by whatever updates
-within the hour, and yanked the same day.
+**Dependabot security updates must be turned off** in Settings → Code security, or every
+security PR arrives twice. Nothing auto-merges a Dependabot PR any more, so leaving them
+on is noisy rather than dangerous.
+
+Two controls Renovate adds that Dependabot had no equivalent for:
+
+- `minimumReleaseAge` holds a new npm release for three days before offering it. The npm
+  supply-chain pattern this defends against is a compromised version that is published,
+  installed by whatever updates within the hour, and yanked the same day. The hold is
+  lifted for `vulnerabilityAlerts`, which exist to fix old versions rather than to adopt
+  new ones — a known-exploitable dependency is not something to sit on until Monday.
+- `osvVulnerabilityAlerts` widens vulnerability detection beyond GitHub's own advisory
+  database, and `transitiveRemediation` lets a fix land as a lockfile-only bump when the
+  vulnerable package is not a direct dependency. Security PRs are never auto-merged: a
+  security fix is frequently a minor or major bump, which is exactly the shape this
+  repository reviews by hand.
 
 `opossum`, `rate-limiter-flexible` and `uuid` were direct production dependencies
 and no longer are — the first two because the controls they provided could not
