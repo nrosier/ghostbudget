@@ -369,6 +369,19 @@ spans the whole mapped set can exist before the first write happens:
 - **One bad mapping does not cost the others their sync.** Each failure is
   recorded, the remaining accounts are still processed, and the run then exits
   non-zero with a summary naming how many failed.
+- **The same holds on the read side.** An Actual Budget account whose balance cannot
+  be read — a closed account with no balance behind it, a name that fails validation,
+  a magnitude that is a corrupted read rather than a balance — is skipped rather than
+  failing the run. It is then simply absent, so a mapping that names it fails to
+  resolve and the run still exits non-zero with that account's own reason. Nothing is
+  written for it, and every other account still syncs. If no account can be read at
+  all, the run fails rather than reporting a successful sync over an empty set.
+- **A transient connection failure is retried, a permanent one is not.** Connecting to
+  Actual Budget and downloading the budget are retried together, up to `MAX_RETRIES`
+  times with an exponential backoff, each attempt starting from a clean shutdown of the
+  previous one. This is what makes a scheduled sync survive a server that has not
+  finished starting up. A wrong password, an unwritable data directory or a malformed
+  sync ID is not transient and still fails on the first attempt.
 - **The run reports what it did, not what it saw.** The completed-sync audit record
   carries `mapped`, `resolved`, `changed`, `written`, `confirmed`, `unchanged` and
   `failed`, so "nothing needed writing tonight" and "two balances were stored" are
@@ -411,6 +424,25 @@ tests/                    # One suite per module above, plus scheduler supervisi
 no HTTP endpoint. `src/scheduler.js` is the container's long-lived process and forks
 `index.js` once per scheduled run.
 
+### Dependency updates
+
+[renovate.json](renovate.json) is the configuration; the bot itself is the
+[Renovate GitHub App](https://github.com/apps/renovate), which has to be installed on
+the repository for any of it to run. Because the config is already committed, Renovate
+skips its onboarding PR and goes straight to opening dependency PRs, and the
+**Dependency Dashboard** issue it creates is where anything it is holding back shows up.
+
+It watches npm, the GitHub Actions the workflows use, and the Dockerfile base-image
+digest. Only patch updates to direct npm dependencies auto-merge, and only after the
+required checks pass; everything else waits for review. New npm releases are held for
+three days before being offered — security fixes excepted, which open immediately and are
+never auto-merged.
+
+Renovate is the **only** dependency bot here. If you are setting this repository up
+yourself, turn **Dependabot security updates off** under Settings → Code security:
+Renovate raises those PRs now, so leaving Dependabot enabled just duplicates them. See
+[SECURITY.md](SECURITY.md#dependency-security) for why there is one bot rather than two.
+
 ### Checks
 
 ```bash
@@ -451,6 +483,12 @@ Common issues and solutions:
    - Verify your Actual Budget and Ghostfolio servers are running
    - Check URLs in `.env` file
    - Verify network connectivity
+   - `Actual Budget connection failed, retrying` in the log is a warning, not a
+     failure: the connect is being retried and the run may still succeed. If the run
+     then fails, the last of those warnings names what it was retrying.
+   - `Could not get remote files` is what a wrong `ACTUAL_BUDGET_SYNC_ID`, a wrong
+     `ACTUAL_BUDGET_PASS` and an unreachable server all look like coming out of Actual
+     Budget's own client. Check all three; the message does not distinguish them.
 
 2. **Authentication Errors**
    - Verify your access tokens/credentials
@@ -476,7 +514,13 @@ Common issues and solutions:
      different value. Read the account in Ghostfolio's UI before re-running;
      something between this tool and the database changed the value.
 
-6. **`confirmed` is lower than `written` in the logs**
+6. **`Skipped N of M accounts` in the log**
+   - Those accounts were not synced and nothing was written for them; the rest of the
+     run went ahead. The message names each one and why. A closed or off-budget account
+     with no balance behind it is the usual cause and is harmless — remove it from
+     `config.json` if it is mapped, and the warning stops being about anything.
+
+7. **`confirmed` is lower than `written` in the logs**
    - Every write was accepted, but the balances could not all be read back — either
      the confirming request failed, or an account was no longer in the list. The
      values were most likely stored; they are simply unverified. If it persists, the

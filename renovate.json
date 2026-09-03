@@ -1,0 +1,104 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommitTypeAll(chore)"],
+  "description": [
+    "The only dependency bot on this repository. It owns both version and security",
+    "updates for all three things that reach production: the npm tree, the GitHub Actions",
+    "the workflows run, and the Dockerfile base-image digest.",
+    "Dependabot is gone entirely — its version updates were redundant with this file, and",
+    "keeping its security updates meant keeping a pull_request_target workflow that held",
+    "contents: write and pull-requests: write in order to auto-merge them. Removing a",
+    "privileged workflow is worth more than the integration was.",
+    "Turn Dependabot security updates OFF in the repository settings (Settings → Code",
+    "security). Left on, they duplicate every PR vulnerabilityAlerts below opens, and",
+    "nothing auto-merges them any more."
+  ],
+  "timezone": "UTC",
+  "schedule": ["after 8am and before 10am on monday"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 4,
+  "rebaseWhen": "conflicted",
+  "internalChecksFilter": "strict",
+  "osvVulnerabilityAlerts": true,
+  "transitiveRemediation": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "description": "Security updates, and the one path that ignores the schedule and the release-age hold above — a known-exploitable version is not something to sit on until Monday, and the hold exists to slow unvetted *new* releases rather than fixes for old ones. Still never automerged: a security fix is frequently a minor or major bump, which is exactly the shape this repository reviews by hand. osvVulnerabilityAlerts widens detection beyond GitHub's own advisories, and transitiveRemediation lets a fix land as a lockfile-only bump when the vulnerable package is not a direct dependency.",
+    "labels": ["dependencies", "security"],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null,
+    "automerge": false
+  },
+  "lockFileMaintenance": {
+    "enabled": false,
+    "description": "A lockfile refresh moves the whole transitive tree in one PR with no upstream release to read. Transitive updates arrive with the direct update that pulls them."
+  },
+  "packageRules": [
+    {
+      "description": "Keep npm versions exact. package.json pins every dependency to a single version deliberately: with financial credentials in this image, an upgrade should be a reviewed commit rather than a range that resolves differently on the next install.",
+      "matchManagers": ["npm"],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Let a new npm release sit for three days before it is offered. The npm supply-chain pattern this defends against is a compromised release that is published, installed by whatever updates within the hour, and yanked the same day. Dependabot has no equivalent control.",
+      "matchManagers": ["npm"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Group non-breaking npm updates by dependency type, and every major on its own, mirroring the grouping dependabot.yml used.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "production dependencies"
+    },
+    {
+      "description": "Development dependencies, grouped separately: they do not ship in the image.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "development dependencies"
+    },
+    {
+      "description": "The only automerge in this config, and the same policy the removed dependabot-auto-merge.yml workflow enforced: a patch update to a direct npm dependency, nothing else. platformAutomerge hands the merge to GitHub, so the required lint, test and security checks still have to pass first — and it needs no workflow and no elevated token, which is why that workflow could go.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies", "devDependencies"],
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Actions and the base image are never automerged, and the rule is stated rather than left implicit. Neither reaches production through the application's dependency tree: action code runs in CI with that job's scopes, including the job holding the registry credentials that publish :latest, and the digest *is* the deployed artifact. Placed after the npm rule so it cannot be overridden by it.",
+      "matchManagers": ["dockerfile", "docker-compose", "github-actions"],
+      "automerge": false,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "GitHub Actions. Renovate updates a pinned SHA and its trailing version comment together, which is the part that is easy to get wrong by hand.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "github actions",
+      "addLabels": ["github-actions"]
+    },
+    {
+      "description": "The Dockerfile base image, pinned by digest. This is the only thing that refreshes that pin, and the digest carries the kernel-adjacent libraries as well as Node itself. The comment above the FROM line records which Node and Alpine versions the digest resolved to and when — re-resolve those when reviewing the PR; the command is in the Dockerfile.",
+      "matchManagers": ["dockerfile"],
+      "addLabels": ["docker"]
+    },
+    {
+      "description": "Node itself, from .nvmrc and package.json engines. A floor bump changes what CI tests and what the image runs, so it is reviewed on its own rather than grouped with anything.",
+      "matchManagers": ["nvm", "npm"],
+      "matchPackageNames": ["node", "npm"],
+      "matchDepTypes": ["engines"],
+      "groupName": "node runtime",
+      "automerge": false
+    },
+    {
+      "description": "Every major on its own PR, in every ecosystem.",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major"],
+      "automerge": false
+    }
+  ]
+}

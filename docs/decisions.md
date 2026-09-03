@@ -262,6 +262,61 @@ balance. The function is shared rather than inlined because the write and the re
 confirms it need the same number; two copies of the expression could drift by a cent and
 turn every confirmed write into a reported mismatch.
 
+### The read leg had no retry at all
+
+`getAccountBalances()` in `src/actualBudget.js`
+
+`axios-retry` is configured on the Ghostfolio client, and `@actual-app/api` builds its own
+HTTP client, so it never covered the Actual Budget leg. `api.init()` and
+`api.downloadBudget()` are both network calls and both failed the whole run on their first
+transient error — including the case that motivated this, a server still starting up when
+the scheduled sync fires at 05:00, where nothing was wrong except the timing.
+
+Connect and download retry as one unit rather than separately, and every attempt after the
+first starts from a full `shutdown()`. `@actual-app/api` holds a server session and a local
+SQLite handle; calling `init()` again on top of one that failed part-way is how a retry
+turns a transient failure into corrupt local state. The download is inside the loop for the
+same reason it needs the retry: it reads the budget over the network, so it fails for the
+same reasons the connect does, and re-downloading wants a fresh session.
+
+Retries are an allowlist, not a denylist. A wrong password, an unwritable data directory
+and a malformed sync ID are permanent — attempting any of them four times against the
+server gains nothing and muddies the audit trail — so an unrecognised failure still fails
+on the first attempt, as it did before. `Could not get remote files` is in the allowlist
+even though a wrong sync ID also produces it: retrying that costs four attempts inside
+seven seconds and reports the identical failure, which is the cheaper mistake.
+
+`AuditLogger.logAuth(true, …)` stays inside the loop, so a run that connected twice records
+two authentications. That is what happened.
+
+### `Promise.all` made one unreadable account fatal for all of them
+
+`getAccountBalances()` in `src/actualBudget.js`
+
+The balances were read with `Promise.all` over the account list, with the validators called
+inside the map. So a single account that failed either validator rejected the whole thing —
+a closed or off-budget account returning `null`, a name that is empty or oversized, a
+magnitude that is a corrupted read — and no account in the budget was synced. The write side
+had implemented the opposite rule for a long time: "one bad mapping does not cost the others
+their sync."
+
+Skipping the account is safe because a skipped account is _absent_, not wrong. `exactlyOneNamed`
+then fails that mapping with `No matching Actual Budget account found for X`, which
+`syncAccountBalances` records per-mapping, so the run still exits non-zero carrying that
+account's own reason while every other account syncs. Nothing is written for the skipped one
+either way; what changes is whether the accounts behind it get written. If no account can be
+read the list comes back empty, and `src/index.js` already refuses that as `No balances
+received from Actual Budget` rather than reporting a sync over nothing. The all-zero gate is
+unaffected: a skipped account never becomes a target, so it cannot make the remaining set
+look uniformly zero.
+
+The loop is sequential, which costs nothing: `@actual-app/api` reads balances out of a local
+better-sqlite3 database and its calls are synchronous, which is the same reason the
+`BATCH_SIZE` above bounded nothing.
+
+The name of an account that failed name validation is not logged. It is exactly the value
+that just failed validation, and `error.log` sits on a mounted volume.
+
 ### Retry is the only resilience layer
 
 `GhostfolioAPI` constructor in `src/ghostfolio.js`
@@ -541,6 +596,42 @@ not persisted, and every run started over.
 ---
 
 ## Tooling
+
+### Renovate replaced Dependabot, and took a privileged workflow with it
+
+`renovate.json`
+
+Two bots watching the same manifests open two PRs per update, so `.github/dependabot.yml`
+went when `renovate.json` arrived. Dependabot _security_ updates were kept at first, since
+those are a repository setting rather than a config file and so survived the file's removal
+— but keeping them meant keeping `.github/workflows/dependabot-auto-merge.yml`, and that is
+what settled it.
+
+That workflow ran on `pull_request_target` and requested `contents: write` and
+`pull-requests: write` in order to approve and merge. It was written carefully — no checkout
+of PR head, the author gated on `dependabot[bot]`, and a `package-ecosystem == 'npm'` clause
+that had to be added in all three expression sites because Dependabot reports github-actions
+and docker updates as a bare `direct`, which `startsWith(…, 'direct')` does not exclude.
+Renovate's `platformAutomerge` reaches the same outcome by handing the merge to GitHub, with
+no workflow, no elevated scopes and no `pull_request_target`. A privileged workflow removed
+is worth more than the integration it served, so both went.
+
+The policy it enforced is intact in `renovate.json`, and stated rather than implied:
+`automerge: false` appears explicitly on the `dockerfile` and `github-actions` managers
+instead of relying on no rule having matched them. Neither reaches production through the
+application's dependency tree — action code runs in CI with that job's scopes, and the
+digest is the deployed artifact.
+
+Two controls have no Dependabot equivalent and are new rather than ported.
+`minimumReleaseAge: 3 days` on npm defends against the supply-chain pattern where a
+compromised release is published, installed by everything that updates within the hour, and
+yanked the same day; it is explicitly lifted for `vulnerabilityAlerts`, which exist to fix
+old versions rather than adopt new ones. And `osvVulnerabilityAlerts` widens detection past
+GitHub's own advisory database, which is what makes dropping Dependabot's security updates a
+change of supplier rather than a loss of coverage.
+
+The one thing this cannot do from a config file: Dependabot security updates have to be
+turned off in the repository settings, or every security PR arrives twice.
 
 ### ESLint's recommended rules were never running
 
