@@ -22,7 +22,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@actual-app/api": "26.8.1",
+    "@actual-app/api": "26.9.0",
     "axios": "1.20.0",
     "axios-retry": "4.5.0",
     "croner": "10.0.1",
