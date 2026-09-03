@@ -51,6 +51,17 @@ Thumbs.db
 .gitlab-ci.yml
 .travis.yml
 
+# Developer and bot tooling. None of it is read at runtime — the image installs with
+# --omit=dev and runs src/scheduler.js — and `COPY . .` would otherwise bake all of it
+# into a layer. `config*.json` above does not cover renovate.json.
+renovate.json
+eslint.config.js
+jest.config.js
+jest.setup.js
+.prettierrc.json
+.prettierignore
+.nvmrc
+
 # Build artifacts
 dist/
 build/

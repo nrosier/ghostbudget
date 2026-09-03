@@ -16,6 +16,14 @@ const MAX_RETRIES = 3; // Maximum retry attempts
 // request chain impossible to bound.
 const MAX_RETRY_DELAY_MS = 8000;
 
+// Base delay for the Actual Budget leg's own backoff, doubling per attempt and capped by
+// MAX_RETRY_DELAY_MS above. axios-retry supplies the schedule on the Ghostfolio leg;
+// @actual-app/api builds its own HTTP client and has no retry of any kind, so that leg
+// computes its delays from this. With MAX_RETRIES = 3 the whole chain spends at most 7 s
+// waiting, which is a rounding error against SYNC_TIMEOUT_MS — the only thing that
+// bounds a connect that hangs rather than failing.
+const RETRY_BASE_DELAY_MS = 1000;
+
 /**
  * Directory for Winston's file transports.
  *
@@ -63,6 +71,7 @@ module.exports = {
   // Retry Configuration
   MAX_RETRIES,
   MAX_RETRY_DELAY_MS,
+  RETRY_BASE_DELAY_MS,
 
   // Scheduler Configuration
   //

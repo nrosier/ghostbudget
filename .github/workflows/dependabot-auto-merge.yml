@@ -6,14 +6,20 @@ name: Dependabot Auto-merge
 # credentials, so an unreviewed transitive dependency must not be able to reach
 # production — main pushes publish :latest, which deployments consume.
 #
-# The npm restriction is load-bearing, not decoration. dependabot.yml also watches
-# github-actions and docker, and Dependabot reports both of those as
-# `dependency-type: direct` — so without the ecosystem check, a patch bump of a
-# workflow action or of the base-image digest would satisfy the conditions below and
-# merge unreviewed. Neither passes through the application's dependency tree on its
-# way to production: action code runs in CI with that job's scopes, including the job
-# holding the registry credentials, and the digest *is* the deployed artifact. Those
-# two always wait for a person.
+# What still reaches this workflow is Dependabot *security* updates. Those are a
+# repository setting rather than a config file, so they outlived the removal of
+# dependabot.yml. Version updates moved to Renovate (renovate.json): its PRs come from
+# renovate[bot], so the author gate below never matches them, dependabot/fetch-metadata
+# could not read them in any case, and its own automerge rules mirror the policy here.
+#
+# The npm restriction is load-bearing, not decoration. Dependabot reports a
+# github-actions or docker update as `dependency-type: direct`, so the "direct" prefix
+# check alone would let a patch bump of a workflow action or of the base-image digest
+# satisfy the conditions below and merge unreviewed. Neither passes through the
+# application's dependency tree on its way to production: action code runs in CI with
+# that job's scopes, including the job holding the registry credentials, and the digest
+# *is* the deployed artifact. Those two always wait for a person, whichever bot
+# proposes them.
 on:
   pull_request_target:
 

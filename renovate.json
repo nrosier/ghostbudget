@@ -1,0 +1,96 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommitTypeAll(chore)"],
+  "description": [
+    "Renovate owns version updates for all three things that reach production: the npm",
+    "tree, the GitHub Actions the workflows run, and the Dockerfile base-image digest.",
+    "It replaced .github/dependabot.yml rather than joining it — two bots watching the",
+    "same manifests open two PRs per update.",
+    "Dependabot still owns *security* updates. Those are a repository setting rather than",
+    "a config file, so removing dependabot.yml did not disable them, and they keep",
+    "flowing through the npm-only gate in .github/workflows/dependabot-auto-merge.yml.",
+    "vulnerabilityAlerts is therefore disabled below: enabling it would duplicate them."
+  ],
+  "timezone": "UTC",
+  "schedule": ["after 8am and before 10am on monday"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 4,
+  "rebaseWhen": "conflicted",
+  "internalChecksFilter": "strict",
+  "vulnerabilityAlerts": {
+    "enabled": false,
+    "description": "Owned by Dependabot security updates. See the note at the top of this file."
+  },
+  "lockFileMaintenance": {
+    "enabled": false,
+    "description": "A lockfile refresh moves the whole transitive tree in one PR with no upstream release to read. Transitive updates arrive with the direct update that pulls them."
+  },
+  "packageRules": [
+    {
+      "description": "Keep npm versions exact. package.json pins every dependency to a single version deliberately: with financial credentials in this image, an upgrade should be a reviewed commit rather than a range that resolves differently on the next install.",
+      "matchManagers": ["npm"],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Let a new npm release sit for three days before it is offered. The npm supply-chain pattern this defends against is a compromised release that is published, installed by whatever updates within the hour, and yanked the same day. Dependabot has no equivalent control.",
+      "matchManagers": ["npm"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Group non-breaking npm updates by dependency type, and every major on its own, mirroring the grouping dependabot.yml used.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "production dependencies"
+    },
+    {
+      "description": "Development dependencies, grouped separately: they do not ship in the image.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "development dependencies"
+    },
+    {
+      "description": "The only automerge in this config: a patch update to a direct npm dependency, which is the same policy dependabot-auto-merge.yml enforces for Dependabot's own PRs. platformAutomerge hands the merge to GitHub, so the required lint, test and security checks still have to pass first.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies", "devDependencies"],
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Actions and the base image are never automerged, and the rule is stated rather than left implicit. Neither reaches production through the application's dependency tree: action code runs in CI with that job's scopes, including the job holding the registry credentials that publish :latest, and the digest *is* the deployed artifact. Placed after the npm rule so it cannot be overridden by it.",
+      "matchManagers": ["dockerfile", "docker-compose", "github-actions"],
+      "automerge": false,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "GitHub Actions. Renovate updates a pinned SHA and its trailing version comment together, which is the part that is easy to get wrong by hand.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "github actions",
+      "addLabels": ["github-actions"]
+    },
+    {
+      "description": "The Dockerfile base image, pinned by digest. This is the only thing that refreshes that pin, and the digest carries the kernel-adjacent libraries as well as Node itself. The comment above the FROM line records which Node and Alpine versions the digest resolved to and when — re-resolve those when reviewing the PR; the command is in the Dockerfile.",
+      "matchManagers": ["dockerfile"],
+      "addLabels": ["docker"]
+    },
+    {
+      "description": "Node itself, from .nvmrc and package.json engines. A floor bump changes what CI tests and what the image runs, so it is reviewed on its own rather than grouped with anything.",
+      "matchManagers": ["nvm", "npm"],
+      "matchPackageNames": ["node", "npm"],
+      "matchDepTypes": ["engines"],
+      "groupName": "node runtime",
+      "automerge": false
+    },
+    {
+      "description": "Every major on its own PR, in every ecosystem.",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major"],
+      "automerge": false
+    }
+  ]
+}

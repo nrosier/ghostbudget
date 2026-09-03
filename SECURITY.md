@@ -92,9 +92,9 @@ contradicts one of them is worth noticing.
 3. **One request in flight at a time.** The sync `await`s each account in turn.
    Sequential execution is a tighter bound than any limiter would impose, and it
    makes each account's failure independently attributable.
-4. **Retry, and nothing above it.** Transient failures are worth retrying; a
-   shared-state control that can refuse requests on another account's behalf is
-   not appropriate for a run this short. The wall-clock backstop is the
+4. **Retry, and nothing above it.** Transient failures are worth retrying, on both
+   legs; a shared-state control that can refuse requests on another account's
+   behalf is not appropriate for a run this short. The wall-clock backstop is the
    scheduler's `SYNC_TIMEOUT_MS`, escalating `SIGTERM` to `SIGKILL`.
 5. **The host decides the transport rule, not `NODE_ENV`.** Plaintext is refused
    wherever the traffic could leave a local network and accepted where it cannot.
@@ -310,6 +310,26 @@ version.
   errors and HTTP 429 up to `MAX_RETRIES` (default 3), with each delay capped at
   `MAX_RETRY_DELAY_MS` ([src/ghostfolio.js](src/ghostfolio.js)). This is the only
   resilience layer wrapped around the HTTP client, deliberately.
+- **The read leg retries too.** `@actual-app/api` builds its own HTTP client, so
+  `axios-retry` never covered it and a server that had not finished starting when the
+  scheduled sync fired failed the whole run on the first attempt. The connect and the
+  budget download now retry as one unit, `MAX_RETRIES` times, backing off from
+  `RETRY_BASE_DELAY_MS` under the same `MAX_RETRY_DELAY_MS` cap
+  ([src/actualBudget.js](src/actualBudget.js)). Retries are an **allowlist** of transient
+  failures: a wrong password, an unwritable data directory or a malformed sync ID is
+  permanent, so it still fails on the first attempt rather than being attempted four times
+  against the server. Every attempt after the first starts from a full `shutdown()` —
+  re-initializing on top of a half-open server session and SQLite handle is how a retry
+  would turn a transient failure into corrupt local state.
+- **An unreadable account costs only that account.** The balances used to be read with
+  `Promise.all`, so one closed account returning a null balance, or one name that failed
+  validation, rejected the whole batch and no account in the budget was synced. Each
+  balance is now read and validated on its own and a failure skips that account. This is
+  safe because a skipped account is _absent_ rather than wrong: the `config.json` mapping
+  that names it fails to resolve, so the run still exits non-zero carrying that account's
+  own reason, and nothing is written for it. If no account can be read the returned list
+  is empty, which [src/index.js](src/index.js) refuses as a failed run rather than
+  reporting a successful sync over nothing.
 - **One request in flight at a time.** A sync `await`s each account in turn, so
   outbound concurrency is one, and a run makes roughly `2 + N` requests for `N`
   mapped accounts. There was a `rate-limiter-flexible` queue in front of this
@@ -450,7 +470,7 @@ push: false`, scans the loaded image, and only then logs in to the registry and
 
 `npm audit` reports **0 known vulnerabilities**, and `npm audit signatures` verifies a
 registry signature for every package in the installed tree. Production dependencies are
-kept current by Dependabot:
+kept current by Renovate:
 
 | Package           | Version |
 | ----------------- | ------- |
@@ -462,21 +482,35 @@ kept current by Dependabot:
 | `joi`             | 18.2.3  |
 | `winston`         | 3.19.0  |
 
-Every version is exact rather than a `^` range. With a committed lockfile this changes
-nothing about what `npm ci` installs; what it changes is that an upgrade cannot arrive as
-a side effect of someone running `npm install`. Each one is a Dependabot PR that was
-reviewed, which is the posture this repository takes with a process that moves account
-balances.
+Every version is exact rather than a `^` range, and `renovate.json` sets
+`rangeStrategy: pin` so it stays that way. With a committed lockfile this changes nothing
+about what `npm ci` installs; what it changes is that an upgrade cannot arrive as a side
+effect of someone running `npm install`. Each one is a reviewed PR, which is the posture
+this repository takes with a process that moves account balances.
 
-[dependabot.yml](.github/dependabot.yml) watches three ecosystems, because three separate
-things reach production: `npm`, `github-actions` (workflow code runs in CI with that job's
-scopes, including the job that holds the registry credentials) and `docker` (the
+[renovate.json](renovate.json) watches three ecosystems, because three separate things
+reach production: `npm`, `github-actions` (workflow code runs in CI with that job's
+scopes, including the job that holds the registry credentials) and `dockerfile` (the
 base-image digest _is_ the deployed artifact). Only npm updates are eligible for
-auto-merge, and only patch-level updates of direct dependencies at that — the ecosystem
-check is enforced in
-[dependabot-auto-merge.yml](.github/workflows/dependabot-auto-merge.yml), not left to the
-`dependency-type` metadata, which reports both of the other two ecosystems as `direct`
-and would otherwise let them through.
+auto-merge, and only patch-level updates of direct dependencies at that; actions and the
+digest carry an explicit `automerge: false` rather than relying on no rule having matched
+them. `platformAutomerge` hands the merge to GitHub, so the required lint, test and
+security checks still gate it.
+
+Renovate replaced `.github/dependabot.yml` rather than joining it — two bots watching the
+same manifests open two PRs per update. Dependabot still owns **security** updates, which
+are a repository setting rather than a config file and so survived that removal; those
+keep flowing through the npm-only gate in
+[dependabot-auto-merge.yml](.github/workflows/dependabot-auto-merge.yml), whose ecosystem
+check is not left to the `dependency-type` metadata — that reports both of the other two
+ecosystems as `direct` and would otherwise let them through. Renovate's own
+`vulnerabilityAlerts` is disabled for exactly that reason: enabling it would duplicate
+those PRs.
+
+One control Renovate adds that Dependabot had no equivalent for: `minimumReleaseAge` holds
+a new npm release for three days before offering it. The npm supply-chain pattern this
+defends against is a compromised version that is published, installed by whatever updates
+within the hour, and yanked the same day.
 
 `opossum`, `rate-limiter-flexible` and `uuid` were direct production dependencies
 and no longer are — the first two because the controls they provided could not
@@ -518,12 +552,11 @@ The [Dockerfile](Dockerfile) pins `node:lts-alpine` to a `sha256` digest. This m
 builds reproducible, but it also means base-image security updates are **not** picked up
 by the tag moving: the digest has to be refreshed deliberately. Two things drive that.
 Trivy runs daily in CI against the built image, which surfaces the need; and
-[dependabot.yml](.github/dependabot.yml) watches the `docker` ecosystem, which opens the
-PR that does it. The Dockerfile also records the command that resolves a new digest by
-hand.
+[renovate.json](renovate.json) watches the `dockerfile` manager, which opens the PR that
+does it. The Dockerfile also records the command that resolves a new digest by hand.
 
 A digest bump is never auto-merged, whatever its semver classification — the digest is
-the deployed artifact, so a person reviews it. Dependabot rewrites the digest but not the
+the deployed artifact, so a person reviews it. The bot rewrites the digest but not the
 comment above it, which records the Node and Alpine versions it resolved to; re-resolve
 those when reviewing the PR.
 
@@ -555,9 +588,10 @@ to them accordingly.
 1. **Token lifecycle management** — expiration checks and refresh handling.
 2. **Supply-chain hardening** — sign the container image. Cosign needs OIDC setup and a
    key-retention policy, which is a decision rather than a patch, so it is still open.
-   (Base-image digest pinning, restricting Dependabot auto-merge to patch-level updates
-   of direct **npm** dependencies, Dependabot coverage of the `docker` and
-   `github-actions` ecosystems, and a CycloneDX SBOM published per build are done — see
+   (Base-image digest pinning, restricting auto-merge to patch-level updates of direct
+   **npm** dependencies, automated update coverage of the `dockerfile` and
+   `github-actions` ecosystems, a three-day `minimumReleaseAge` on npm releases, and a
+   CycloneDX SBOM published per build are done — see
    [docker-image.yml](.github/workflows/docker-image.yml). The SBOM is generated from the
    same local image the pre-push Trivy gate passed, so what is inventoried is what ships
    and a rejected image never gets one.)
