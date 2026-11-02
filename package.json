@@ -25,7 +25,7 @@
     "@actual-app/api": "26.9.0",
     "axios": "1.20.0",
     "axios-retry": "4.5.0",
-    "croner": "10.0.1",
+    "croner": "11.0.0",
     "dotenv": "17.4.2",
     "joi": "18.2.8",
     "winston": "3.19.0"
